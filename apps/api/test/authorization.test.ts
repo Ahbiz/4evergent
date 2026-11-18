@@ -42,7 +42,7 @@ function makeAgent(id: string, ownerId: string, status = "active") {
     displayName: `Agent ${id}`,
     description: "test agent",
     ownerId,
-    stellarAddress: "GDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    stellarAddress: "GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U",
     capabilities: ["payment"],
     status,
     createdAt: new Date().toISOString(),

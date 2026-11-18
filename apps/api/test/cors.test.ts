@@ -108,7 +108,7 @@ test("CORS: Idempotency-Key header is in allow-list", async () => {
         id: "new-agent",
         displayName: "New Agent",
         description: "test",
-        stellarAddress: "GDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        stellarAddress: "GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U",
         capabilities: ["payment"],
       }),
     });

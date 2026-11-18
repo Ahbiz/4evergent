@@ -1,4 +1,24 @@
 import type { AgentIntent } from "@4evergent/shared";
+import { StrKey } from "@stellar/stellar-sdk";
+
+/**
+ * Stellar asset codes are 1-12 characters from `[A-Za-z0-9_]` — the same
+ * constraint `new Asset(...)` enforces at build time. Anything outside that
+ * set is rejected here so the pipeline fails fast with a validation error
+ * instead of a construction error.
+ */
+function isValidAssetCode(code: string): boolean {
+  return /^[A-Za-z0-9_]{1,12}$/.test(code);
+}
+
+/**
+ * A Stellar account address is a 56-character StrKey-encoded ed25519 public
+ * key — length and `G` prefix alone are not enough, the checksum must verify.
+ * `StrKey.isValidEd25519PublicKey` checks all three.
+ */
+function isValidStellarAccount(address: string): boolean {
+  return StrKey.isValidEd25519PublicKey(address);
+}
 
 export class IntentValidator {
   static readonly VALID_ASSETS = ["XLM"];
@@ -23,11 +43,11 @@ export class IntentValidator {
 function parseAsset(intent: AgentIntent): { code: string; issuer: string | null } | null {
   if (intent.type !== "payment") return null;
   if (intent.assetDetails) {
-    if (!intent.assetDetails.code || intent.assetDetails.code.length < 1) return null;
+    if (!intent.assetDetails.code || !isValidAssetCode(intent.assetDetails.code)) return null;
     if (intent.assetDetails.code === "XLM") {
       return { code: "XLM", issuer: null };
     }
-    if (!intent.assetDetails.issuer || !intent.assetDetails.issuer.startsWith("G")) return null;
+    if (!intent.assetDetails.issuer || !isValidStellarAccount(intent.assetDetails.issuer)) return null;
     return { code: intent.assetDetails.code, issuer: intent.assetDetails.issuer };
   }
   if (intent.asset === "XLM") return { code: "XLM", issuer: null };
@@ -39,7 +59,7 @@ function validatePayment(intent: AgentIntent): { valid: boolean; error?: string 
   if (!intent.amount || isNaN(parseFloat(intent.amount)) || parseFloat(intent.amount) <= 0) {
     return { valid: false, error: "amount must be a positive number" };
   }
-  if (!intent.destination || !intent.destination.startsWith("G")) {
+  if (!intent.destination || !isValidStellarAccount(intent.destination)) {
     return { valid: false, error: "destination must be a valid Stellar account (G...)" };
   }
   if (parseFloat(intent.amount) > parseFloat(IntentValidator.MAX_AMOUNT)) {
@@ -63,7 +83,10 @@ function validateTrustline(intent: AgentIntent): { valid: boolean; error?: strin
   if (intent.assetCode === "XLM") {
     return { valid: false, error: "XLM is native and cannot be used as a trustline" };
   }
-  if (!intent.issuer || !intent.issuer.startsWith("G")) {
+  if (!isValidAssetCode(intent.assetCode)) {
+    return { valid: false, error: "assetCode must be 1-12 alphanumeric characters (A-Z, a-z, 0-9, _)" };
+  }
+  if (!intent.issuer || !isValidStellarAccount(intent.issuer)) {
     return { valid: false, error: "issuer must be a valid Stellar account" };
   }
   if (intent.limit !== undefined) {

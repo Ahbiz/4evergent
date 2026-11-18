@@ -20,7 +20,7 @@ const TEST_AGENT = {
   displayName: "Test",
   description: "test agent",
   ownerId: "test",
-  stellarAddress: "GDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  stellarAddress: "GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U",
   capabilities: [],
   status: "active",
   createdAt: new Date().toISOString(),

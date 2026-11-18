@@ -197,6 +197,116 @@ describe('ScheduleManagement', () => {
     });
   });
 
+  test('issuer field appears for non-XLM assets and is hidden for XLM', async () => {
+    mockListSchedules.mockResolvedValue({ schedules: [] });
+
+    render(<MemoryRouter><ScheduleManagement agentId="agent-1" /></MemoryRouter>);
+
+    await waitFor(() => {
+      expect(screen.getByText('Create Schedule')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText('Create Schedule'));
+
+    // XLM is the default asset: no issuer field.
+    expect(screen.queryByLabelText(/Asset Issuer/)).not.toBeInTheDocument();
+
+    // Switch to USDC: the issuer field appears.
+    fireEvent.change(screen.getByLabelText('Asset'), { target: { value: 'USDC' } });
+    expect(screen.getByLabelText(/Asset Issuer/)).toBeInTheDocument();
+
+    // Switch back to XLM: the issuer field disappears again.
+    fireEvent.change(screen.getByLabelText('Asset'), { target: { value: 'XLM' } });
+    expect(screen.queryByLabelText(/Asset Issuer/)).not.toBeInTheDocument();
+  });
+
+  test('USDC create sends assetDetails with the intent', async () => {
+    mockListSchedules.mockResolvedValue({ schedules: [] });
+    mockCreateSchedule.mockResolvedValue({ schedule: defaultSchedule });
+
+    render(<MemoryRouter><ScheduleManagement agentId="agent-1" /></MemoryRouter>);
+
+    await waitFor(() => {
+      expect(screen.getByText('Create Schedule')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText('Create Schedule'));
+
+    fireEvent.change(screen.getByLabelText('Asset'), { target: { value: 'USDC' } });
+
+    const issuerInput = await screen.findByLabelText(/Asset Issuer/);
+    fireEvent.change(issuerInput, { target: { value: 'GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U' } });
+
+    const amountInput = screen.getByPlaceholderText('10');
+    fireEvent.change(amountInput, { target: { value: '25' } });
+
+    const destInput = screen.getByPlaceholderText('G...');
+    fireEvent.change(destInput, { target: { value: 'GB3KJPLFUYN5VL6R3GU3EGCGVCKFDSD7BEDX42HWG5BWFKB3KQGJJRMA' } });
+
+    const reasonInput = screen.getByPlaceholderText('Recurring payment');
+    fireEvent.change(reasonInput, { target: { value: 'Monthly USDC payment' } });
+
+    const exprInput = screen.getByPlaceholderText('0 0 * * * (minute hour day-of-month month day-of-week)');
+    fireEvent.change(exprInput, { target: { value: '0 0 1 * *' } });
+
+    const submitButton = screen.getByText('Create Schedule');
+    fireEvent.click(submitButton);
+
+    await waitFor(() => {
+      expect(mockCreateSchedule).toHaveBeenCalledWith('agent-1', expect.objectContaining({
+        intent: expect.objectContaining({
+          type: 'payment',
+          asset: 'USDC',
+          assetDetails: { code: 'USDC', issuer: 'GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U' },
+          amount: '25',
+          reason: 'Monthly USDC payment',
+        }),
+        scheduleExpression: '0 0 1 * *',
+        timezone: 'UTC',
+      }));
+    });
+  });
+
+  test('XLM create sends no assetDetails', async () => {
+    mockListSchedules.mockResolvedValue({ schedules: [] });
+    mockCreateSchedule.mockResolvedValue({ schedule: defaultSchedule });
+
+    render(<MemoryRouter><ScheduleManagement agentId="agent-1" /></MemoryRouter>);
+
+    await waitFor(() => {
+      expect(screen.getByText('Create Schedule')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText('Create Schedule'));
+
+    const amountInput = await screen.findByPlaceholderText('10');
+    fireEvent.change(amountInput, { target: { value: '25' } });
+
+    const destInput = screen.getByPlaceholderText('G...');
+    fireEvent.change(destInput, { target: { value: 'GB3KJPLFUYN5VL6R3GU3EGCGVCKFDSD7BEDX42HWG5BWFKB3KQGJJRMA' } });
+
+    const reasonInput = screen.getByPlaceholderText('Recurring payment');
+    fireEvent.change(reasonInput, { target: { value: 'Monthly payment' } });
+
+    const exprInput = screen.getByPlaceholderText('0 0 * * * (minute hour day-of-month month day-of-week)');
+    fireEvent.change(exprInput, { target: { value: '0 0 1 * *' } });
+
+    const submitButton = screen.getByText('Create Schedule');
+    fireEvent.click(submitButton);
+
+    await waitFor(() => {
+      expect(mockCreateSchedule).toHaveBeenCalledWith('agent-1', expect.objectContaining({
+        intent: expect.objectContaining({
+          type: 'payment',
+          asset: 'XLM',
+          amount: '25',
+        }),
+      }));
+    });
+    const sentIntent = mockCreateSchedule.mock.calls[0]![1].intent;
+    expect(sentIntent.assetDetails).toBeUndefined();
+  });
+
   test('successful create refreshes schedule list', async () => {
     mockListSchedules.mockResolvedValueOnce({ schedules: [] });
     mockCreateSchedule.mockResolvedValue({ schedule: defaultSchedule });

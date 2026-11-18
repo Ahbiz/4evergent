@@ -30,7 +30,7 @@ function makeIntent(): AgentIntent {
   return {
     type: "payment",
     asset: "XLM",
-    destination: "GDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    destination: "GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U",
     amount: "10",
     reason: "test execution",
   };

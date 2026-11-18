@@ -24,7 +24,7 @@ function makeAgent(id: string, ownerId: string) {
     displayName: "Test",
     description: "test agent",
     ownerId,
-    stellarAddress: "GDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    stellarAddress: "GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U",
     capabilities: [],
     status: "active" as const,
     createdAt: new Date().toISOString(),
@@ -55,7 +55,7 @@ async function startServer(opts?: { policyRules?: Partial<PolicyRules>; signer?:
 const INTENT_BODY = {
   type: "payment",
   asset: "XLM",
-  destination: "GDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  destination: "GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U",
   amount: "100",
   reason: "test payment",
 };

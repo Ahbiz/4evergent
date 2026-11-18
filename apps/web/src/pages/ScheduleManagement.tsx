@@ -253,6 +253,7 @@ function CreateScheduleForm({ agentId, onSuccess, onError }: {
   onError: (e: string) => void;
 }) {
   const [asset, setAsset] = useState('XLM');
+  const [issuer, setIssuer] = useState('');
   const [destination, setDestination] = useState('');
   const [amount, setAmount] = useState('');
   const [reason, setReason] = useState('');
@@ -272,6 +273,9 @@ function CreateScheduleForm({ agentId, onSuccess, onError }: {
     const intent: SubmitPaymentIntent = {
       type: 'payment',
       asset: asset === 'XLM' ? 'XLM' : asset,
+      // A non-native payment needs its issuer to build a Stellar transaction;
+      // without assetDetails the schedule would fail on every run.
+      ...(asset !== 'XLM' ? { assetDetails: { code: asset, issuer } } : {}),
       destination,
       amount,
       reason,
@@ -309,6 +313,20 @@ function CreateScheduleForm({ agentId, onSuccess, onError }: {
             <option value="BTC">BTC</option>
           </select>
         </label>
+        {asset !== 'XLM' && (
+          <label>
+            <span>Asset Issuer (G...)</span>
+            <input
+              id="schedule-issuer"
+              type="text"
+              value={issuer}
+              onChange={(e) => setIssuer(e.target.value)}
+              placeholder="G... (asset issuer)"
+              required
+              aria-label="Asset Issuer (G...)"
+            />
+          </label>
+        )}
         <label>
           <span>Amount</span>
           <input
