@@ -38,6 +38,13 @@ export function validateScheduleIntent(intent?: AgentIntent): ScheduleValidation
   if (!intent.destination || !intent.destination.startsWith('G')) return { valid: false, error: 'invalid destination' };
   if (!intent.amount || isNaN(parseFloat(intent.amount)) || parseFloat(intent.amount) <= 0) return { valid: false, error: 'invalid amount' };
   if (!intent.reason || intent.reason.length < 3) return { valid: false, error: 'reason too short' };
+  // A non-native payment needs an asset issuer to build a Stellar
+  // transaction — StellarTransactionBuilder.buildPayment throws
+  // "non-XLM asset requires issuer" without one. Reject the doomed schedule
+  // at creation time instead of letting every run fail at execution.
+  if (intent.asset !== 'XLM' && !intent.assetDetails?.issuer) {
+    return { valid: false, error: `non-XLM asset ${intent.asset} requires assetDetails.issuer` };
+  }
   return { valid: true };
 }
 
