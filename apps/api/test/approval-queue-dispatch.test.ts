@@ -16,7 +16,7 @@ import type { PolicyRules } from "@4evergent/shared";
 // Stellar network steps stubbed at the prototype level (no live Horizon).
 
 const TX_HASH = "stub-tx-hash-275";
-const ADDRESS = "GDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const ADDRESS = "GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U";
 const DESTINATION = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
 
 async function post(baseUrl: string, path: string, body: unknown) {

@@ -28,7 +28,7 @@ const TEST_AGENT = {
   displayName: "Test",
   description: "test agent",
   ownerId: "test",
-  stellarAddress: "GDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  stellarAddress: "GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U",
   capabilities: [],
   createdAt: new Date().toISOString(),
   updatedAt: new Date().toISOString(),
@@ -36,7 +36,7 @@ const TEST_AGENT = {
   metadata: {},
 };
 
-const DESTINATION = "GDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const DESTINATION = "GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U";
 
 async function startServer(opts?: { policyRules?: Partial<PolicyRules> }) {
   const server = await createApiServer({
