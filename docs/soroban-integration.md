@@ -199,7 +199,7 @@ const info = result?.retval ? scValToNative(result.retval) : null;
 
 - A **permanent tombstone**: `active` set to `false`, record stays queryable,
   the id can never be re-registered (`contracts/agent-registry/src/lib.rs:233-234`).
-- Fails `Deactivated` if already inactive (no-op, not an error).
+- Fails `Deactivated` if already inactive: a second `deactivate` is an error, not a no-op — it emits no event and changes no state (no `updated_at` bump, no TTL extension), so callers can detect double-processing.
 - Emits `("agent", "deactivated")` with data `(id, owner)`.
 
 ---

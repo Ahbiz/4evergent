@@ -70,6 +70,12 @@
 //!   count is checked first (`TooManyCapabilities`), then each capability is
 //!   examined in order and the first violation wins, in the order
 //!   `CapabilityEmpty` → `CapabilityTooLong` → `CapabilityDuplicate`.
+//! - **Repeat deactivation is an error**: a second `deactivate` on an
+//!   already-inactive agent returns `Error::Deactivated` and changes nothing
+//!   (no event, no `updated_at` bump, no TTL extension). An idempotent
+//!   no-op was rejected because the error lets callers detect
+//!   double-processing, and it matches `update_metadata`, which also rejects
+//!   deactivated agents with `Error::Deactivated`.
 //!
 //! Future: delegation, multi-sig registration, capability discovery events.
 
@@ -307,6 +313,15 @@ impl AgentRegistry {
     /// Deactivate the agent — a PERMANENT tombstone. The record stays
     /// queryable, but the id can never be re-registered (even by this owner)
     /// and there is no reactivation entrypoint. Only the registered owner.
+    ///
+    /// Repeat deactivation is an ERROR, not a no-op: a second `deactivate`
+    /// on an already-inactive agent returns `Err(Error::Deactivated)` and
+    /// changes nothing — no `updated_at` bump, no TTL extension, no second
+    /// `("agent", "deactivated")` event. This matches `update_metadata`,
+    /// which also rejects deactivated agents with `Error::Deactivated`, so
+    /// a caller can rely on the error to detect double-processing instead
+    /// of silently re-emitting a lifecycle event that would confuse
+    /// off-chain indexers.
     pub fn deactivate(env: Env, caller: Address, id: String) -> Result<bool, Error> {
         caller.require_auth();
         let key = DataKey::Agent(id.clone());
@@ -317,6 +332,9 @@ impl AgentRegistry {
             .ok_or(Error::NotFound)?;
         if info.owner != caller {
             return Err(Error::NotAuthorized);
+        }
+        if !info.active {
+            return Err(Error::Deactivated);
         }
         info.active = false;
         info.updated_at = env.ledger().timestamp();
@@ -681,6 +699,40 @@ mod test {
         assert!(!info.active);
         // Tombstone: still readable, metadata preserved.
         assert_eq!(info.display_name, String::from_str(&env, "Test"));
+    }
+
+    // A second `deactivate` on the same agent errors with `Error::Deactivated`
+    // and changes nothing: no second event, no `updated_at` bump, no TTL
+    // extension. (Deliberate choice over idempotent no-op: the error lets a
+    // caller detect double-processing, and it matches `update_metadata`.)
+    #[test]
+    fn test_double_deactivate_errors() {
+        let (env, cid, client) = setup();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let id = String::from_str(&env, "agent_1");
+        register(&env, &client, &owner, &id, "Test");
+
+        client.deactivate(&owner, &id);
+        let info_after_first = client.query(&id).unwrap();
+        assert!(!info_after_first.active);
+        let ttl_after_first = entry_ttl(&env, &cid, "agent_1");
+        let events_after_first = env.events().all().len();
+
+        let res = client.try_deactivate(&owner, &id);
+        assert_eq!(want_err(res), Error::Deactivated);
+
+        // State untouched by the failed second call.
+        let info = client.query(&id).unwrap();
+        assert!(!info.active);
+        assert_eq!(info.updated_at, info_after_first.updated_at);
+        assert_eq!(info.display_name, String::from_str(&env, "Test"));
+        assert_eq!(entry_ttl(&env, &cid, "agent_1"), ttl_after_first);
+        assert_eq!(
+            env.events().all().len(),
+            events_after_first,
+            "second deactivate must not re-emit the deactivated event"
+        );
     }
 
     // ---- regression tests for the independent security review fixes ----
