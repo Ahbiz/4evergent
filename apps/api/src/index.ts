@@ -9,7 +9,7 @@ import type {
 } from "@4evergent/shared";
 import { API_ERRORS, type ApiErrorCode } from "./error-codes.js";
 import { IntentValidator } from "@4evergent/agent-core";
-import { PolicyEngine, DEFAULT_RULES, validatePolicyRules, normalizePolicyRules } from "@4evergent/policy";
+import { PolicyEngine, DEFAULT_RULES, validatePolicyRules, normalizePolicyRules, parseStrictAmount } from "@4evergent/policy";
 import { StellarAdapter } from "@4evergent/agent-core";
 import { TransactionPipeline } from "@4evergent/stellar";
 import type { Signer } from "@4evergent/stellar";
@@ -430,21 +430,37 @@ export async function createApiServer(options: ServerOptions) {
           throw err;
         }
         try {
-          const sourceAccount = await getSourceAccount();
-          if (context?.signal?.aborted) {
-            const err = new Error("Execution was cancelled");
-            err.name = "AbortError";
-            throw err;
+          // #275: records carrying an approvalId must go through
+          // executeApproved(), not execute(). execute() re-evaluates policy,
+          // sees requires_approval again, and creates a DUPLICATE approval —
+          // so an approved intent could never be submitted on the default
+          // queue path. Records without an approvalId (scheduler, manual)
+          // keep using execute().
+          let outcome: Awaited<ReturnType<typeof pipeline.executeApproved>>;
+          if (record.approvalId) {
+            outcome = await pipeline.executeApproved(record.approvalId, undefined, {
+              signal: context?.signal,
+              onBeforeSubmit: () => {
+                context?.onBeforeSubmit?.();
+              },
+            });
+          } else {
+            const sourceAccount = await getSourceAccount();
+            if (context?.signal?.aborted) {
+              const err = new Error("Execution was cancelled");
+              err.name = "AbortError";
+              throw err;
+            }
+            outcome = await pipeline.execute({
+              intent: record.intent,
+              sourceAccount,
+              activityId: record.activityId ?? undefined,
+              signal: context?.signal,
+              onBeforeSubmit: () => {
+                context?.onBeforeSubmit?.();
+              },
+            });
           }
-          const outcome = await pipeline.execute({
-            intent: record.intent,
-            sourceAccount,
-            activityId: record.activityId ?? undefined,
-            signal: context?.signal,
-            onBeforeSubmit: () => {
-              context?.onBeforeSubmit?.();
-            },
-          });
           const txHash = (outcome as { txHash?: string }).txHash;
           if (txHash) {
             context?.onSubmitted?.(txHash);
@@ -2051,6 +2067,12 @@ function parseIntent(body: unknown): AgentIntent {
       if (typeof b.asset !== "string") throw new Error("payment.asset is required");
       if (typeof b.destination !== "string") throw new Error("payment.destination is required");
       if (typeof b.amount !== "string") throw new Error("payment.amount is required as string");
+      // Strict amount (#264): parseFloat would read 10 out of "10abc" and
+      // 100 out of "1e2". Reject anything that is not a canonical Stellar
+      // decimal (digits, optional "." + 1–7 fractional digits).
+      if (parseStrictAmount(b.amount) === null) {
+        throw new Error("payment.amount must be a valid Stellar amount (digits with up to 7 decimal places)");
+      }
       if (typeof b.reason !== "string") throw new Error("payment.reason is required");
       let validatedDetails: { code: string; issuer: string | null } | undefined;
       const assetDetails = (b.assetDetails as { code?: unknown; issuer?: unknown } | undefined);
@@ -2087,6 +2109,9 @@ function parseIntent(body: unknown): AgentIntent {
       if (b.assetCode === "XLM") throw new Error("XLM cannot be used as a trustline asset");
       if (typeof b.issuer !== "string" || !b.issuer.startsWith("G") || b.issuer.length !== 56) {
         throw new Error("trustline.issuer must be a valid Stellar address (G...)");
+      }
+      if (typeof b.limit === "string" && b.limit.trim().length > 0 && parseStrictAmount(b.limit) === null) {
+        throw new Error("trustline.limit must be a valid Stellar amount (digits with up to 7 decimal places)");
       }
       if (typeof b.reason !== "string") throw new Error("trustline.reason is required");
       return {

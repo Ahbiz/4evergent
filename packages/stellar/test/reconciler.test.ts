@@ -178,3 +178,47 @@ test("Reconciler: start/stop lifecycle", async () => {
   reconciler.stop();
   assert.equal(reconciler.isRunning(), false);
 });
+
+test("Reconciler: failed outcome clears the stale retry schedule (#378)", async () => {
+  const store = new InMemoryExecutionStore();
+  const execution = makeExecution({
+    status: "submitted",
+    txHash: "tx-5",
+    nextRetryAt: "2020-01-01T00:00:00.000Z",
+  });
+  await store.record(execution);
+
+  const provider = {
+    getStatus: async () => "failed" as const,
+  };
+
+  const reconciler = new TransactionStatusReconciler(store, provider, { intervalMs: 60000 });
+  const result = await reconciler.reconcile();
+
+  assert.equal(result.failed, 1);
+  const updated = await store.get(execution.id);
+  assert.equal(updated?.status, "failed");
+  assert.equal(updated?.nextRetryAt, null);
+});
+
+test("Reconciler: confirmed outcome clears the stale retry schedule (#378)", async () => {
+  const store = new InMemoryExecutionStore();
+  const execution = makeExecution({
+    status: "submitted",
+    txHash: "tx-6",
+    nextRetryAt: "2020-01-01T00:00:00.000Z",
+  });
+  await store.record(execution);
+
+  const provider = {
+    getStatus: async () => "confirmed" as const,
+  };
+
+  const reconciler = new TransactionStatusReconciler(store, provider, { intervalMs: 60000 });
+  const result = await reconciler.reconcile();
+
+  assert.equal(result.confirmed, 1);
+  const updated = await store.get(execution.id);
+  assert.equal(updated?.status, "confirmed");
+  assert.equal(updated?.nextRetryAt, null);
+});

@@ -1,6 +1,7 @@
 import type { AgentIntent, PolicyDecision } from "@4evergent/shared";
 import { type PolicyRules } from "./types.js";
 import { normalizePolicyRules } from "./validation.js";
+import { parseStrictAmount } from "./amount.js";
 
 /**
  * PolicyEngine — deterministic, pure policy evaluation.
@@ -96,11 +97,18 @@ export class PolicyEngine {
       intent,
     });
 
-    // 0. Amount validation — reject zero, negative, or non-numeric
+    // 0. Amount validation — reject zero, negative, or non-numeric.
+    // Strict: "10abc" and "1e2" are not amounts, even though parseFloat
+    // would silently read 10 / 100 out of them (#264).
     const amountStr = extractAmount(intent);
+    const amountNum = amountStr !== null ? parseStrictAmount(amountStr) : null;
     if (amountStr !== null) {
-      const amountNum = parseFloat(amountStr);
-      if (isNaN(amountNum)) {
+      if (amountNum === null) {
+        // A well-formed negative amount ("-10") keeps the historical
+        // "must be positive" reason; anything else is malformed.
+        if (/^-\d+(?:\.\d{1,7})?$/.test(amountStr)) {
+          return decide("deny", `Amount must be positive, got ${Number(amountStr)}`, "positiveAmount");
+        }
         return decide("deny", `Invalid amount: '${amountStr}' is not a valid number`, "invalidAmount");
       }
       if (amountNum <= 0) {
@@ -133,9 +141,12 @@ export class PolicyEngine {
           // Skip reservation but still check the limit (read-only).
           // Used by executeApproved to verify tightened policy without double-reserving.
           const spent = await this.getDailySpent(asset, agentId);
-          const limitNum = parseFloat(dailyLimit);
+          // A malformed limit can only come from rules that bypassed
+          // validatePolicyRules; fall back to NaN so the comparison is
+          // false, exactly as the old parseFloat path behaved.
+          const limitNum = parseStrictAmount(dailyLimit) ?? Number.NaN;
           const remaining = limitNum - spent;
-          if (parseFloat(amountStr) > remaining) {
+          if ((amountNum as number) > remaining) {
             return decide(
               "deny",
               `Amount ${amountStr} ${asset} exceeds daily limit: spent ${spent.toFixed(7)}, limit ${limitNum}, remaining ${remaining.toFixed(7)}`,
@@ -155,9 +166,10 @@ export class PolicyEngine {
           }
         } else {
           const spent = await this.getDailySpent(asset, agentId);
-          const limitNum = parseFloat(dailyLimit);
+          // See the skipReservation branch above for the NaN fallback.
+          const limitNum = parseStrictAmount(dailyLimit) ?? Number.NaN;
           const remaining = limitNum - spent;
-          if (parseFloat(amountStr) > remaining) {
+          if ((amountNum as number) > remaining) {
             return decide(
               "deny",
               `Amount ${amountStr} ${asset} exceeds daily limit: spent ${spent.toFixed(7)}, limit ${limitNum}, remaining ${remaining.toFixed(7)}`,
@@ -222,7 +234,9 @@ export class PolicyEngine {
       if (activityAsset !== asset) continue;
       const amount = extractAmount(activity.intent);
       if (amount !== null) {
-        total += parseFloat(amount);
+        // Malformed stored amounts contribute 0 rather than the
+        // parseFloat-truncated value, so the gate and the ledger agree.
+        total += parseStrictAmount(amount) ?? 0;
       }
     }
 
@@ -251,9 +265,9 @@ function extractAsset(intent: AgentIntent): string {
 }
 
 function compareAmounts(a: string, b: string): number {
-  const pa = parseFloat(a);
-  const pb = parseFloat(b);
-  if (isNaN(pa) || isNaN(pb)) return 0;
+  const pa = parseStrictAmount(a);
+  const pb = parseStrictAmount(b);
+  if (pa === null || pb === null) return 0;
   return pa > pb ? 1 : pa < pb ? -1 : 0;
 }
 

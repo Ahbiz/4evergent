@@ -99,14 +99,18 @@ export class TransactionStatusReconciler {
           const updated = await this.executionStore.updateIfStatus(
             execution.id,
             "submitted",
-            { status: "confirmed", completedAt: this.clock().toISOString(), updatedAt: this.clock().toISOString() }
+            { status: "confirmed", completedAt: this.clock().toISOString(), updatedAt: this.clock().toISOString(), nextRetryAt: null }
           );
           if (updated) result.confirmed++;
         } else if (status === "failed") {
           const updated = await this.executionStore.updateIfStatus(
             execution.id,
             "submitted",
-            { status: "failed", error: "Transaction failed on-chain", updatedAt: this.clock().toISOString() }
+            // #378: a terminal on-chain outcome carries no retry schedule.
+            // Without this, a stale nextRetryAt from an earlier attempt
+            // would survive on the failed record (complete() clears it on
+            // submit, but a record submitted before that fix keeps it).
+            { status: "failed", error: "Transaction failed on-chain", updatedAt: this.clock().toISOString(), nextRetryAt: null }
           );
           if (updated) result.failed++;
         }
