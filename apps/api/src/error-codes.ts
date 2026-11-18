@@ -26,6 +26,7 @@ export const API_ERRORS = {
   AGENT_STATUS_INVALID_TRANSITION: { status: 409, message: "Agent status does not allow this transition", description: "The agent's current status does not allow the requested status transition; see details for currentStatus and requestedStatus." },
   SCHEDULE_INVALID_TRANSITION: { status: 409, message: "Schedule status does not allow this transition", description: "The schedule status does not allow the requested pause, resume or disable." },
   EXECUTION_CONFLICT: { status: 409, message: "Execution state changed; please refresh", description: "The execution changed concurrently." },
+  APPROVAL_CONFLICT: { status: 409, message: "Approval state changed; please refresh", description: "The approval was decided concurrently by another request." },
   APPROVAL_EXPIRED: { status: 410, message: "Approval expired", description: "The approval passed its expiry before it was approved." },
 } as const;
 

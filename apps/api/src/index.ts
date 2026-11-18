@@ -19,6 +19,7 @@ import { ExecutionQueue } from "./execution-queue.js";
 import { ExecutionRecoveryService } from "./execution-recovery.js";
 import { ScheduleRecoveryService } from "./schedule-recovery.js";
 import { TransactionStatusReconciler } from "@4evergent/stellar";
+import { ApprovalRecoveryService } from "@4evergent/stellar";
 import { AccountSequenceCoordinator } from "./account-sequence-coordinator.js";
 import type { ExecutionRecord, ExecutionStatus } from "@4evergent/database";
 import type { ScheduleExecutionResult } from "./schedule-execution.js";
@@ -165,6 +166,16 @@ export interface ServerOptions {
     enabled?: boolean;
     intervalMs?: number;
     instance?: import("@4evergent/stellar").TransactionStatusReconciler;
+  };
+  /** Recover approvals stuck in `executing` after a crash (#376).
+   *  Runs once at startup when the execution queue is enabled and, when
+   *  reconciliation is enabled, sweeps periodically on the same lifecycle.
+   *  The on-chain check uses the Horizon adapter, so no extra config is
+   *  needed; pass `instance` to inject a custom service (e.g. for testing). */
+  approvalRecovery?: {
+    intervalMs?: number;
+    staleAfterMs?: number;
+    instance?: import("@4evergent/stellar").ApprovalRecoveryService;
   };
 }
 
@@ -379,6 +390,35 @@ export async function createApiServer(options: ServerOptions) {
     }
   }
 
+  // --- Stuck-approval recovery setup (#376) ---
+  // Same crash window as executions, one level up: an approval left in
+  // `executing` (process died between approval and submission) never reaches
+  // a terminal state on its own. Recover once at startup (before the queue
+  // worker starts, so a recovered approval is never executed twice) and
+  // sweep periodically while the server runs. The on-chain check reuses the
+  // Horizon adapter; without a stored hash the approval is failed with an
+  // explicit "could not verify" error (see ApprovalRecoveryService).
+  const approvalRecovery: import("@4evergent/stellar").ApprovalRecoveryService =
+    options.approvalRecovery?.instance ??
+    new ApprovalRecoveryService(approvals, store, {
+      getStatus: (txHash: string) => adapter.getTransactionStatus(txHash),
+    }, {
+      intervalMs: options.approvalRecovery?.intervalMs,
+      staleAfterMs: options.approvalRecovery?.staleAfterMs,
+    });
+  if (options.executionQueue?.enabled) {
+    try {
+      const approvalRecoveryResult = await approvalRecovery.recover();
+      if (approvalRecoveryResult.found > 0) {
+        console.log(
+          `[approval-recovery] recovered ${approvalRecoveryResult.recovered}/${approvalRecoveryResult.found} stuck approvals`
+        );
+      }
+    } catch (err) {
+      console.error("[approval-recovery] recovery failed:", err);
+    }
+  }
+
   // --- Transaction status reconciliation setup ---
   if (options.reconciliation?.enabled) {
     const statusProvider: import("@4evergent/stellar").TransactionStatusProvider = {
@@ -391,6 +431,9 @@ export async function createApiServer(options: ServerOptions) {
       });
     reconciler.start();
     console.log("[reconciler] started, interval:", options.reconciliation.intervalMs ?? 30_000, "ms");
+    // Periodic stuck-approval sweep rides on the reconciliation lifecycle.
+    approvalRecovery.start();
+    console.log("[approval-recovery] started, interval:", options.approvalRecovery?.intervalMs ?? 60_000, "ms");
   }
 
   if (options.executionQueue?.enabled) {
@@ -1749,7 +1792,16 @@ export async function createApiServer(options: ServerOptions) {
       return approvalError(res, "APPROVAL_EXPIRED", { approvalId, activityId: approval.activityId, status: "expired", message: "approval expired" });
     }
 
-    await approvals.update(approvalId, { status: "approved", approvedAt: new Date().toISOString(), approver: approver ?? null });
+    // Atomic claim: pending_approval → approved in one conditional step.
+    // A concurrent approve/reject that lands first wins; this request then
+    // gets null and returns 409 instead of enqueueing a second execution.
+    // (The transition check above still rejects a SEQUENTIAL second decision
+    // — e.g. approve after reject — with APPROVAL_INVALID_STATE.)
+    const claimed = await approvals.updateIfStatus(approvalId, "pending_approval", { status: "approved", approvedAt: new Date().toISOString(), approver: approver ?? null });
+    if (!claimed) {
+      const current = await approvals.get(approvalId);
+      return approvalError(res, "APPROVAL_CONFLICT", { approvalId, activityId: approval.activityId, status: current?.status ?? approval.status, message: `approval already decided (now ${current?.status ?? approval.status}); refresh before retrying` });
+    }
 
     // Enqueue for execution via the persistent execution queue.
     // If the queue is not enabled, fall back to setImmediate (Phase 8 behavior).
@@ -1823,7 +1875,16 @@ export async function createApiServer(options: ServerOptions) {
       return approvalError(res, "APPROVAL_INVALID_STATE", { approvalId, activityId: approval.activityId, status: approval.status, message: `cannot reject: ${transitionError}` });
     }
 
-    await approvals.update(approvalId, { status: "rejected", rejectedAt: new Date().toISOString() });
+    // Atomic claim: pending_approval → rejected in one conditional step.
+    // A concurrent approve/reject that lands first wins; this request then
+    // gets null and returns 409 with no state change and no execution record.
+    // (The transition check above still rejects a SEQUENTIAL second decision
+    // — e.g. reject after approve — with APPROVAL_INVALID_STATE.)
+    const claimed = await approvals.updateIfStatus(approvalId, "pending_approval", { status: "rejected", rejectedAt: new Date().toISOString() });
+    if (!claimed) {
+      const current = await approvals.get(approvalId);
+      return approvalError(res, "APPROVAL_CONFLICT", { approvalId, activityId: approval.activityId, status: current?.status ?? approval.status, message: `approval already decided (now ${current?.status ?? approval.status}); refresh before retrying` });
+    }
     await store.update(approval.activityId, { status: "rejected", authorizationStatus: "denied_by_policy", error: "approval rejected by human" });
 
     return json(res, toApprovalResponse(approvalId, approval.activityId, "rejected", "approval rejected"), 200);
@@ -1876,6 +1937,10 @@ export async function createApiServer(options: ServerOptions) {
         if (reconciler) {
           reconciler.stop();
           console.log("[reconciler] stopped");
+        }
+        if (approvalRecovery.isRunning()) {
+          approvalRecovery.stop();
+          console.log("[approval-recovery] stopped");
         }
         if (retentionTimer) {
           clearInterval(retentionTimer);

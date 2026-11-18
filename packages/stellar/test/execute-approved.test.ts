@@ -11,6 +11,7 @@ import type { AgentIntent, PolicyDecision } from "@4evergent/shared";
 import { StellarAdapter } from "@4evergent/agent-core";
 import { TransactionPipeline } from "../src/pipeline.js";
 import type { Signer } from "../src/signer.js";
+import { normalizePolicyRules, type PolicyRules } from "@4evergent/policy";
 
 const HORIZON_URL = "https://horizon-testnet.stellar.org";
 const PASSPHRASE = "Test SDF Network ; September 2015";
@@ -45,17 +46,22 @@ async function createFixture(options: {
   status?: ApprovalRecord["status"];
   expiresAt?: string | null;
   maxTxAmount?: string;
+  intentAmount?: string;
+  policyResolver?: (agentId: string) => Promise<PolicyRules>;
   submit?: () => Promise<{ hash: string; ledger: number }>;
 } = {}) {
   const activityStore = new InMemoryActivityStore();
   const approvalStore = new InMemoryApprovalStore();
+  const fixtureIntent: AgentIntent = options.intentAmount
+    ? { ...intent, amount: options.intentAmount }
+    : intent;
   const decision: PolicyDecision = {
     result: "requires_approval",
     reason: "Requires human approval",
     rule: "approvalThreshold",
-    intent,
+    intent: fixtureIntent,
   };
-  const activity = createActivity("agent-1", "owner-1", intent, decision);
+  const activity = createActivity("agent-1", "owner-1", fixtureIntent, decision);
   activity.status = "requires_approval";
   activity.authorizationStatus = "pending_approval";
   await activityStore.record(activity);
@@ -64,7 +70,7 @@ async function createFixture(options: {
     activity.id,
     "agent-1",
     "owner-1",
-    intent,
+    fixtureIntent,
     decision,
     options.expiresAt ?? new Date(Date.now() + 60_000).toISOString(),
   );
@@ -86,6 +92,7 @@ async function createFixture(options: {
       approvalThreshold: "100",
       txTypeRestrictions: { payment: true },
     },
+    policyResolver: options.policyResolver,
   });
 
   const internals = pipeline as unknown as {
@@ -173,12 +180,66 @@ test("executeApproved re-evaluates policy tightened after approval", async () =>
   const result = await fixture.pipeline.executeApproved(fixture.approval.id);
 
   assert.equal(result.status, "rejected");
-  assert.match(result.message, /Policy re-evaluation denied/);
+  assert.match(result.message, /Policy re-evaluation did not allow execution/);
   assert.equal(result.policyDecision.result, "deny");
   assert.equal(result.policyDecision.rule, "maxTxAmount");
   const savedApproval = await fixture.approvalStore.get(fixture.approval.id);
   assert.equal(savedApproval?.status, "failed");
   assert.equal(fixture.signer.calls, 0);
+});
+
+// #354: the approval itself satisfies the threshold gate, so an
+// above-threshold approval still executes — re-evaluation must not re-trigger
+// requires_approval for the approved amount.
+test("executeApproved executes an above-threshold approval (threshold satisfied by approval)", async () => {
+  await withOfflineAccount(async () => {
+    const fixture = await createFixture({ intentAmount: "150", maxTxAmount: "1000" });
+    const result = await fixture.pipeline.executeApproved(fixture.approval.id, "reviewer-1");
+
+    assert.equal(result.status, "submitted");
+    assert.equal(result.txHash, TX_HASH);
+    const savedApproval = await fixture.approvalStore.get(fixture.approval.id);
+    assert.equal(savedApproval?.status, "submitted");
+    assert.equal(fixture.signer.calls, 1);
+  });
+});
+
+// #354: tightening the allowlist between approval and execution blocks it —
+// fail-closed, no silent re-queue, reason surfaced on approval + activity.
+test("executeApproved blocks execution when the allowlist tightened after approval", async () => {
+  await withOfflineAccount(async () => {
+    const destination = intent.destination;
+    const currentRules: Partial<PolicyRules> = {
+      maxTxAmount: { XLM: "1000" },
+      dailySpendingLimit: { XLM: "500" },
+      allowedAssets: ["XLM"],
+      allowedDestinations: [destination],
+      requireHumanApprovalForAmountAbove: "100",
+      approvalThreshold: "100",
+      txTypeRestrictions: { payment: true },
+    };
+    const fixture = await createFixture({
+      intentAmount: "150",
+      maxTxAmount: "1000",
+      policyResolver: async () => normalizePolicyRules(currentRules),
+    });
+    // Policy tightened after approval: destination removed from allowlist.
+    currentRules.allowedDestinations = ["GOTHERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"];
+
+    const result = await fixture.pipeline.executeApproved(fixture.approval.id);
+
+    assert.equal(result.status, "rejected");
+    assert.match(result.message, /allowed_destinations/);
+    assert.equal(result.policyDecision.result, "deny");
+    assert.equal(result.policyDecision.rule, "allowedDestinations");
+    const savedApproval = await fixture.approvalStore.get(fixture.approval.id);
+    assert.equal(savedApproval?.status, "failed");
+    assert.match(savedApproval?.error ?? "", /allowed_destinations/);
+    const savedActivity = await fixture.activityStore.get(fixture.activity.id);
+    assert.equal(savedActivity?.status, "failed");
+    assert.match(savedActivity?.error ?? "", /allowed_destinations/);
+    assert.equal(fixture.signer.calls, 0);
+  });
 });
 
 test("executeApproved records the signed hash when submission fails", async () => {

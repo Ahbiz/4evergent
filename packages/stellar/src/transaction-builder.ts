@@ -13,6 +13,39 @@ export interface AssetIdentifier {
   issuer: string | null;
 }
 
+/**
+ * Single fee source for every transaction this builder constructs.
+ *
+ * Stellar's network base fee is 100 stroops (0.00001 XLM). The builder used
+ * to hardcode 100000 stroops (0.01 XLM) — 1000x the base fee — in each of
+ * buildPayment/buildTrustline/buildAccountSettings.
+ *
+ * Resolution order: explicit constructor option > STELLAR_BASE_FEE env var >
+ * DEFAULT_BASE_FEE_STROOPS ("100"). A configured value must be a positive
+ * integer number of stroops; anything else fails fast at construction so a
+ * typo can never silently submit at an unintended fee. This is a static
+ * configured fee only — no dynamic surge pricing. The simulator still
+ * enforces fee >= live network base fee (see simulator.ts), untouched here.
+ */
+export const DEFAULT_BASE_FEE_STROOPS = "100";
+export const STELLAR_BASE_FEE_ENV_VAR = "STELLAR_BASE_FEE";
+
+export interface StellarTransactionBuilderOptions {
+  /** Base fee in stroops, e.g. "100". Overrides STELLAR_BASE_FEE. */
+  baseFeeStroops?: string;
+}
+
+export function resolveBaseFeeStroops(explicit?: string): string {
+  const raw = explicit ?? process.env[STELLAR_BASE_FEE_ENV_VAR] ?? DEFAULT_BASE_FEE_STROOPS;
+  if (!/^[0-9]+$/.test(raw) || BigInt(raw) <= 0n) {
+    throw new Error(
+      `StellarTransactionBuilder: base fee must be a positive integer number of stroops, got '${raw}' ` +
+        `(set ${STELLAR_BASE_FEE_ENV_VAR} or pass baseFeeStroops)`
+    );
+  }
+  return raw;
+}
+
 function parseAssetInput(input: { asset?: string; assetDetails?: { code: string; issuer: string | null } }): AssetIdentifier {
   if (input.assetDetails) {
     return { code: input.assetDetails.code, issuer: input.assetDetails.issuer };
@@ -27,6 +60,17 @@ function toStellarAsset(id: AssetIdentifier): Asset {
 }
 
 export class StellarTransactionBuilder {
+  private readonly baseFeeStroops: string;
+
+  constructor(options: StellarTransactionBuilderOptions = {}) {
+    this.baseFeeStroops = resolveBaseFeeStroops(options.baseFeeStroops);
+  }
+
+  /** The fee (stroops) this builder puts on every transaction it builds. */
+  getBaseFeeStroops(): string {
+    return this.baseFeeStroops;
+  }
+
   async buildPayment(
     sourceAccount: Account,
     intent: PaymentIntent,
@@ -60,7 +104,7 @@ export class StellarTransactionBuilder {
 
     const builder = new TransactionBuilder(sourceAccount, {
       networkPassphrase,
-      fee: "100000",
+      fee: this.baseFeeStroops,
     });
     builder.addMemo(Memo.text(truncateToMemo(intent.reason)));
     builder.addOperation(paymentOp);
@@ -97,7 +141,7 @@ export class StellarTransactionBuilder {
 
     const builder = new TransactionBuilder(sourceAccount, {
       networkPassphrase,
-      fee: "100000",
+      fee: this.baseFeeStroops,
     });
     builder.addMemo(Memo.text(truncateToMemo(intent.reason)));
     builder.addOperation(changeTrustOp);
@@ -123,7 +167,7 @@ export class StellarTransactionBuilder {
 
     const builder = new TransactionBuilder(sourceAccount, {
       networkPassphrase,
-      fee: "100000",
+      fee: this.baseFeeStroops,
     });
     builder.addMemo(Memo.text(truncateToMemo(intent.reason)));
     builder.addOperation(setOptionsOp);

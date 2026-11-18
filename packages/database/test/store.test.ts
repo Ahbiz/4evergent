@@ -177,6 +177,53 @@ function runStoreTests(name: string, makeStores: () => { activity: ActivityStore
     const keys = Object.keys(appr);
     assert.ok(!keys.some((k) => /secret|seed|private|mnemonic/i.test(k)));
   });
+
+  // #372: atomic compare-and-swap for the approve/reject claim.
+  test(`${name}: updateIfStatus claims pending_approval exactly once`, async () => {
+    const { approval, cleanup } = makeStores();
+    try {
+      const appr = createApproval("act-1", "agent-a", "owner-a", makeIntent("1"), makeDecision("requires_approval"), null);
+      await approval.record(appr);
+      const claimed = await approval.updateIfStatus(appr.id, "pending_approval", { status: "approved", approvedAt: new Date().toISOString() });
+      assert.ok(claimed);
+      assert.equal(claimed.status, "approved");
+      // Second claim with the same expected status loses: record moved on.
+      assert.equal(await approval.updateIfStatus(appr.id, "pending_approval", { status: "rejected" }), null);
+      assert.equal((await approval.get(appr.id))?.status, "approved");
+    } finally {
+      cleanup?.();
+    }
+  });
+
+  test(`${name}: updateIfStatus returns null on mismatched status or unknown id`, async () => {
+    const { approval, cleanup } = makeStores();
+    try {
+      const appr = createApproval("act-1", "agent-a", "owner-a", makeIntent("1"), makeDecision("requires_approval"), null);
+      await approval.record(appr);
+      assert.equal(await approval.updateIfStatus(appr.id, "approved", { status: "rejected" }), null);
+      assert.equal((await approval.get(appr.id))?.status, "pending_approval");
+      assert.equal(await approval.updateIfStatus("missing", "pending_approval", { status: "approved" }), null);
+    } finally {
+      cleanup?.();
+    }
+  });
+
+  test(`${name}: updateIfStatus concurrent claims — exactly one winner`, async () => {
+    const { approval, cleanup } = makeStores();
+    try {
+      const appr = createApproval("act-1", "agent-a", "owner-a", makeIntent("1"), makeDecision("requires_approval"), null);
+      await approval.record(appr);
+      const [first, second] = await Promise.all([
+        approval.updateIfStatus(appr.id, "pending_approval", { status: "approved" }),
+        approval.updateIfStatus(appr.id, "pending_approval", { status: "rejected" }),
+      ]);
+      const winners = [first, second].filter(Boolean);
+      assert.equal(winners.length, 1, "exactly one concurrent claim may win");
+      assert.equal((await approval.get(appr.id))?.status, winners[0]!.status);
+    } finally {
+      cleanup?.();
+    }
+  });
 }
 
 // In-memory

@@ -502,9 +502,79 @@ export class SQLiteApprovalStore implements ApprovalStore {
     return updated;
   }
 
+  async updateIfStatus(id: string, expectedStatus: ApprovalStatus, patch: Partial<ApprovalRecord>): Promise<ApprovalRecord | null> {
+    const partial = buildApprovalPartialUpdate(patch);
+    if (!partial) {
+      const row = this.db
+        .prepare("SELECT * FROM approvals WHERE id = ? AND status = ?")
+        .get(id, expectedStatus) as unknown as ApprovalRow | undefined;
+      return row ? rowToApprovalRecord(row) : null;
+    }
+
+    // Single-statement compare-and-swap: the status guard is evaluated by
+    // SQLite in the same statement that writes, so exactly one concurrent
+    // claimer can win and no other column is overwritten. (Same rationale as
+    // SQLiteExecutionStore.updateIfStatus; see execution-store.ts.)
+    // updated_at is always refreshed, matching InMemoryApprovalStore.
+    const result = this.db
+      .prepare(`UPDATE approvals SET ${partial.sql}, updated_at = @p_updated_at WHERE id = @id AND status = @expected_status`)
+      .run({ ...partial.params, p_updated_at: new Date().toISOString(), id, expected_status: expectedStatus });
+    if (Number(result.changes) === 0) return null;
+
+    return this.get(id);
+  }
+
   close(): void {
     // Shared connection — managed by closeSharedConnection() / closeAllSharedConnections()
   }
+}
+
+/**
+ * Columns writable by SQLiteApprovalStore.updateIfStatus().
+ * `id` is deliberately absent: the primary key is immutable.
+ */
+const APPROVAL_WRITE_COLUMNS: Record<string, string> = {
+  activityId: "activity_id",
+  agentId: "agent_id",
+  ownerId: "owner_id",
+  intent: "intent_json",
+  policyDecision: "policy_decision_json",
+  status: "status",
+  requestedAt: "requested_at",
+  approvedAt: "approved_at",
+  rejectedAt: "rejected_at",
+  expiredAt: "expired_at",
+  approver: "approver",
+  expiresAt: "expires_at",
+  txHash: "tx_hash",
+  error: "error",
+  createdAt: "created_at",
+  updatedAt: "updated_at",
+};
+
+const APPROVAL_JSON_COLUMNS = new Set(["intent_json", "policy_decision_json"]);
+
+/**
+ * Builds a partial SET clause from a patch: only the caller's fields are
+ * written, in one statement. `undefined` values are skipped ("field not
+ * supplied"); explicit `null` clears. Returns null when the patch carries
+ * nothing writable (caller falls back to a status-guarded read).
+ */
+function buildApprovalPartialUpdate(patch: Partial<ApprovalRecord>): { sql: string; params: Record<string, unknown> } | null {
+  const assignments: string[] = [];
+  const params: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(patch)) {
+    // hasOwnProperty guard: a `__proto__`/`constructor` key from an untrusted
+    // patch must not resolve to an inherited value and end up in the SET clause.
+    if (!Object.prototype.hasOwnProperty.call(APPROVAL_WRITE_COLUMNS, key)) continue;
+    const column = APPROVAL_WRITE_COLUMNS[key];
+    if (!column || value === undefined) continue;
+    const param = `p_${column}`;
+    assignments.push(`${column} = @${param}`);
+    params[param] = APPROVAL_JSON_COLUMNS.has(column) ? JSON.stringify(value) : value;
+  }
+  if (assignments.length === 0) return null;
+  return { sql: assignments.join(", "), params };
 }
 
 // ============================================================
