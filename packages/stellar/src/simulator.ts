@@ -1,5 +1,13 @@
-import { Horizon, type Transaction } from "@stellar/stellar-sdk";
+import { Horizon, type Asset, type Transaction } from "@stellar/stellar-sdk";
 import type { SimulationResult } from "@4evergent/shared";
+
+/**
+ * Minimum XLM a payment must carry to create a non-existent destination
+ * account. A new Stellar account must be funded with at least 1 XLM — the
+ * minimum balance for a bare account (2 x the 0.5 XLM base reserve).
+ * Source: https://developers.stellar.org/docs/learn/fundamentals/stellar-data-structures/accounts
+ */
+const MIN_ACCOUNT_CREATION_XLM = 1;
 
 /**
  * Simulator — mandatory gate before signing.
@@ -16,6 +24,10 @@ import type { SimulationResult } from "@4evergent/shared";
  *  - the transaction sequence number is exactly the on-chain sequence + 1,
  *  - the source account's XLM balance covers amount + fee + minimum reserve,
  *  - the destination is a valid G... address (validated by TransactionBuilder),
+ *  - every payment destination exists on the network — or, if it does not,
+ *    the payment carries at least 1 XLM, the minimum to create an account,
+ *  - every non-native payment destination holds a trustline for the asset
+ *    (otherwise Horizon rejects the payment with `op_no_trust`),
  *  - the transaction fee is >= network base fee.
  *
  * Signature correctness is NOT checked here — it is checked by Horizon at
@@ -107,12 +119,80 @@ export class StellarSimulator {
       }
     }
 
+    // 7. Destination-account preconditions, one per payment operation.
+    //    Non-payment operations (changeTrust, account settings, ...) carry
+    //    no payment destination and are skipped.
+    for (const op of transaction.operations) {
+      if (op.type !== "payment") continue;
+      const dest = await this.checkDestination(op);
+      if (!dest.ok) return fail(transaction.fee, ops, dest.error);
+    }
+
     return {
       success: true,
       fee: transaction.fee,
       operations: ops,
       warnings,
     };
+  }
+
+  /**
+   * Destination precondition for a single payment operation, using the same
+   * `Horizon.Server` seam as the source-account load.
+   *
+   * A load failure is treated as "account does not exist": by the time this
+   * runs, the source-account load (check 3) has already proven Horizon is
+   * reachable, so a failure here is a genuine 404, not a network outage.
+   */
+  private async checkDestination(op: {
+    destination: string;
+    asset: Asset;
+    amount: string;
+  }): Promise<{ ok: true } | { ok: false; error: string }> {
+    let destAccount: any;
+    try {
+      destAccount = await this.server.accounts().accountId(op.destination).call();
+    } catch {
+      destAccount = null;
+    }
+
+    if (!destAccount) {
+      // Non-existent destination: only a native payment at or above the
+      // account-creation minimum can succeed (it creates the account).
+      if (!op.asset.isNative()) {
+        return {
+          ok: false,
+          error: `Destination account ${op.destination} does not exist and cannot receive ${op.asset.code} (no trustline; only a native XLM payment of at least ${MIN_ACCOUNT_CREATION_XLM} XLM can create an account)`,
+        };
+      }
+      if (Number(op.amount) < MIN_ACCOUNT_CREATION_XLM) {
+        return {
+          ok: false,
+          error: `Destination account ${op.destination} does not exist and payment of ${op.amount} XLM is below the ${MIN_ACCOUNT_CREATION_XLM} XLM minimum to create an account`,
+        };
+      }
+      return { ok: true };
+    }
+
+    // Existing destination: a non-native payment needs a trustline, or
+    // Horizon rejects the payment with `op_no_trust`.
+    if (!op.asset.isNative()) {
+      const balances = (destAccount.balances ?? []) as {
+        asset_type: string;
+        asset_code?: string;
+        asset_issuer?: string;
+      }[];
+      const hasTrustline = balances.some(
+        (b) => b.asset_code === op.asset.code && b.asset_issuer === op.asset.issuer
+      );
+      if (!hasTrustline) {
+        return {
+          ok: false,
+          error: `Destination account ${op.destination} has no trustline for ${op.asset.code}:${op.asset.issuer}`,
+        };
+      }
+    }
+    return { ok: true };
   }
 }
 

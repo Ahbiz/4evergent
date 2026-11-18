@@ -26,17 +26,18 @@ import { StellarSimulator } from "../src/simulator.js";
 
 const SOURCE = Keypair.random().publicKey();
 const DEST = Keypair.random().publicKey();
+const ISSUER = Keypair.random().publicKey();
 const HORIZON_URL = "https://horizon-testnet.stellar.org";
 
 type FakeAccount = {
   sequence: string;
-  balances: { asset_type: string; balance: string; asset_code?: string }[];
+  balances: { asset_type: string; balance: string; asset_code?: string; asset_issuer?: string }[];
   subentry_count?: number;
 };
 
 function fakeAccount(opts: {
   sequence: string;
-  balances?: { asset_type: string; balance: string; asset_code?: string }[];
+  balances?: { asset_type: string; balance: string; asset_code?: string; asset_issuer?: string }[];
   subentry_count?: number;
 }): FakeAccount {
   return {
@@ -46,18 +47,29 @@ function fakeAccount(opts: {
   };
 }
 
-/** Minimal stand-in for the two Horizon calls `simulate()` makes. */
-function fakeServer(opts: { baseFee?: number | Error; account?: unknown | Error }): Horizon.Server {
+/**
+ * Minimal stand-in for the Horizon calls `simulate()` makes. `account` is
+ * served for the source; `destinationAccount` is served for the payment
+ * destination (defaults to the source account, i.e. an existing destination
+ * with a native balance). Pass an `Error` to make the load throw, as Horizon
+ * does with a 404 for a non-existent account.
+ */
+function fakeServer(opts: {
+  baseFee?: number | Error;
+  account?: unknown | Error;
+  destinationAccount?: unknown | Error;
+}): Horizon.Server {
   return {
     fetchBaseFee: async () => {
       if (opts.baseFee instanceof Error) throw opts.baseFee;
       return opts.baseFee ?? 100;
     },
     accounts: () => ({
-      accountId: () => ({
+      accountId: (id: string) => ({
         call: async () => {
-          if (opts.account instanceof Error) throw opts.account;
-          return opts.account;
+          const target = id === DEST ? opts.destinationAccount ?? opts.account : opts.account;
+          if (target instanceof Error) throw target;
+          return target;
         },
       }),
     }),
@@ -69,6 +81,7 @@ function buildTx(opts: {
   accountSequence: string;
   fee?: string;
   amount?: string;
+  asset?: Asset;
 }): Transaction {
   const source = new Account(SOURCE, opts.accountSequence);
   return new TransactionBuilder(source, {
@@ -76,7 +89,7 @@ function buildTx(opts: {
     networkPassphrase: Networks.TESTNET,
   })
     .addOperation(
-      Operation.payment({ destination: DEST, asset: Asset.native(), amount: opts.amount ?? "10" })
+      Operation.payment({ destination: DEST, asset: opts.asset ?? Asset.native(), amount: opts.amount ?? "10" })
     )
     .setTimeout(30)
     .build();
@@ -177,6 +190,152 @@ test("SIMULATOR: warns when remaining balance is under 1 XLM", async () => {
     result.warnings.some((w) => /under 1 XLM/.test(w)),
     `expected under-1-XLM warning, got: ${JSON.stringify(result.warnings)}`
   );
+});
+
+// ── Check 7: destination-account preconditions ───────────────────────────────
+test("SIMULATOR: payment below 1 XLM to a non-existent destination fails", async () => {
+  const sim = new StellarSimulator(
+    HORIZON_URL,
+    fakeServer({
+      baseFee: 100,
+      account: fakeAccount({ sequence: "100" }),
+      destinationAccount: new Error("404 Not Found"),
+    })
+  );
+  const tx = buildTx({ accountSequence: "100", fee: "100", amount: "0.5" });
+  const result = await sim.simulate(tx);
+  assert.equal(result.success, false);
+  assert.match(result.error ?? "", /does not exist/i);
+  assert.match(result.error ?? "", /1 XLM minimum/);
+});
+
+test("SIMULATOR: payment of at least 1 XLM to a non-existent destination succeeds (account creation)", async () => {
+  const sim = new StellarSimulator(
+    HORIZON_URL,
+    fakeServer({
+      baseFee: 100,
+      account: fakeAccount({ sequence: "100" }),
+      destinationAccount: new Error("404 Not Found"),
+    })
+  );
+  const tx = buildTx({ accountSequence: "100", fee: "100", amount: "10" });
+  const result = await sim.simulate(tx);
+  assert.equal(result.success, true);
+});
+
+test("SIMULATOR: payment of exactly 1 XLM to a non-existent destination succeeds", async () => {
+  const sim = new StellarSimulator(
+    HORIZON_URL,
+    fakeServer({
+      baseFee: 100,
+      account: fakeAccount({ sequence: "100" }),
+      destinationAccount: new Error("404 Not Found"),
+    })
+  );
+  const tx = buildTx({ accountSequence: "100", fee: "100", amount: "1" });
+  const result = await sim.simulate(tx);
+  assert.equal(result.success, true);
+});
+
+test("SIMULATOR: non-native payment to an account without the trustline fails naming the asset", async () => {
+  const sim = new StellarSimulator(
+    HORIZON_URL,
+    fakeServer({
+      baseFee: 100,
+      account: fakeAccount({ sequence: "100" }),
+      destinationAccount: fakeAccount({
+        sequence: "5",
+        balances: [{ asset_type: "native", balance: "50.0000000" }],
+      }),
+    })
+  );
+  const tx = buildTx({
+    accountSequence: "100",
+    fee: "100",
+    amount: "10",
+    asset: new Asset("USDC", ISSUER),
+  });
+  const result = await sim.simulate(tx);
+  assert.equal(result.success, false);
+  assert.match(result.error ?? "", /no trustline/i);
+  assert.match(result.error ?? "", /USDC/);
+});
+
+test("SIMULATOR: non-native payment to an account with the trustline succeeds", async () => {
+  const sim = new StellarSimulator(
+    HORIZON_URL,
+    fakeServer({
+      baseFee: 100,
+      account: fakeAccount({ sequence: "100" }),
+      destinationAccount: fakeAccount({
+        sequence: "5",
+        balances: [
+          { asset_type: "native", balance: "50.0000000" },
+          { asset_type: "credit_alphanum4", asset_code: "USDC", asset_issuer: ISSUER, balance: "0.0000000" },
+        ],
+      }),
+    })
+  );
+  const tx = buildTx({
+    accountSequence: "100",
+    fee: "100",
+    amount: "10",
+    asset: new Asset("USDC", ISSUER),
+  });
+  const result = await sim.simulate(tx);
+  assert.equal(result.success, true);
+});
+
+test("SIMULATOR: non-native payment to a non-existent destination fails naming the asset", async () => {
+  const sim = new StellarSimulator(
+    HORIZON_URL,
+    fakeServer({
+      baseFee: 100,
+      account: fakeAccount({ sequence: "100" }),
+      destinationAccount: new Error("404 Not Found"),
+    })
+  );
+  const tx = buildTx({
+    accountSequence: "100",
+    fee: "100",
+    amount: "10",
+    asset: new Asset("USDC", ISSUER),
+  });
+  const result = await sim.simulate(tx);
+  assert.equal(result.success, false);
+  assert.match(result.error ?? "", /does not exist/i);
+  assert.match(result.error ?? "", /USDC/);
+});
+
+test("SIMULATOR: trustline for a different issuer does not satisfy the check", async () => {
+  const sim = new StellarSimulator(
+    HORIZON_URL,
+    fakeServer({
+      baseFee: 100,
+      account: fakeAccount({ sequence: "100" }),
+      destinationAccount: fakeAccount({
+        sequence: "5",
+        balances: [
+          { asset_type: "native", balance: "50.0000000" },
+          {
+            asset_type: "credit_alphanum4",
+            asset_code: "USDC",
+            asset_issuer: Keypair.random().publicKey(),
+            balance: "100.0000000",
+          },
+        ],
+      }),
+    })
+  );
+  const tx = buildTx({
+    accountSequence: "100",
+    fee: "100",
+    amount: "10",
+    asset: new Asset("USDC", ISSUER),
+  });
+  const result = await sim.simulate(tx);
+  assert.equal(result.success, false);
+  assert.match(result.error ?? "", /no trustline/i);
 });
 
 // ── Success path ─────────────────────────────────────────────────────────────
