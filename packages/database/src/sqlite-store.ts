@@ -8,6 +8,7 @@ import type {
 } from "@4evergent/shared";
 import { getSharedConnection } from "./shared-connection.js";
 import { clampOffset, clampLimit } from "./pagination.js";
+import { ensureTable, MigrationError } from "./migration.js";
 import type {
   ActivityStore,
   ApprovalStore,
@@ -34,7 +35,10 @@ export class SQLiteActivityStore implements ActivityStore {
   }
 
   private initSchema(): void {
-    this.db.exec(`
+    // #401: any failure creating the base schema must also fail loudly
+    // with the table named, never silently start on a broken database.
+    try {
+      this.db.exec(`
       CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT);
 
       CREATE TABLE IF NOT EXISTS activities (
@@ -60,9 +64,18 @@ export class SQLiteActivityStore implements ActivityStore {
         ON activities(owner_id, agent_id, idempotency_key)
         WHERE idempotency_key IS NOT NULL;
     `);
-    // Phase 23: daily_spending table for atomic spending reservation
-    try {
-      this.db.exec(`
+    } catch (err) {
+      throw new MigrationError("activities", null, err);
+    }
+    // Phase 23: daily_spending table for atomic spending reservation.
+    // #401: this used to be a bare try/catch that swallowed every failure,
+    // so the server could start healthy on a database without this table.
+    // CREATE TABLE IF NOT EXISTS never throws "already exists", so any
+    // error here is real and must abort startup (MigrationError).
+    ensureTable(
+      this.db,
+      "daily_spending",
+      `
         CREATE TABLE IF NOT EXISTS daily_spending (
           agent_id TEXT NOT NULL,
           asset TEXT NOT NULL,
@@ -71,10 +84,8 @@ export class SQLiteActivityStore implements ActivityStore {
           PRIMARY KEY (agent_id, asset, day)
         );
       CREATE INDEX IF NOT EXISTS idx_daily_spending_day ON daily_spending(day);
-      `);
-    } catch {
-      // Table already exists.
-    }
+      `
+    );
   }
 
   async record(record: ActivityRecord): Promise<void> {

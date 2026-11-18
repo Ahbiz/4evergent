@@ -35,6 +35,19 @@ export interface PipelineExecuteInput {
   onBeforeSubmit?: () => void | Promise<void>;
 }
 
+/**
+ * Options for `executeApproved` (issue #275).
+ *
+ * The queue path dispatches approved records here instead of `execute()`,
+ * so it needs the same abort/cancellation parity `execute()` has: an
+ * AbortSignal that throws AbortError, and an `onBeforeSubmit` hook invoked
+ * (with abort re-checked) immediately before submission.
+ */
+export interface ExecuteApprovedOptions {
+  signal?: AbortSignal;
+  onBeforeSubmit?: () => void | Promise<void>;
+}
+
 export class TransactionPipeline {
   private builder: StellarTransactionBuilder;
   private simulator: StellarSimulator;
@@ -252,7 +265,23 @@ export class TransactionPipeline {
    * the agent's CURRENT policy at execution time. If policy was tightened between
    * approval and execution, the execution is denied.
    */
-  async executeApproved(approvalId: string, approver?: string): Promise<PipelineOutcome> {
+  async executeApproved(
+    approvalId: string,
+    approver?: string,
+    options?: ExecuteApprovedOptions
+  ): Promise<PipelineOutcome> {
+    // Abort parity with execute(): cancellation throws AbortError instead
+    // of returning a rejection, so the queue treats it as a cancel, not a
+    // failure to retry (#275).
+    const checkAbort = () => {
+      if (options?.signal?.aborted) {
+        const err = new Error("Execution was cancelled");
+        err.name = "AbortError";
+        throw err;
+      }
+    };
+    checkAbort();
+
     if (!this.approvalStore || !this.activityStore) {
       return {
         status: "rejected",
@@ -306,6 +335,7 @@ export class TransactionPipeline {
     // the intent must be denied.
     // skipReservation: daily spending was already reserved at intent-creation time.
     // Re-evaluating here must NOT double-reserve.
+    checkAbort();
     const currentDecision = await this.policy.evaluate(approval.intent, approval.agentId, { skipReservation: true });
     if (currentDecision.result === "deny") {
       await this.approvalStore.update(approvalId, { status: "failed", error: `Policy re-evaluation denied: ${currentDecision.reason}` });
@@ -320,6 +350,7 @@ export class TransactionPipeline {
 
     await this.approvalStore.update(approvalId, { status: "executing" });
 
+    checkAbort();
     const intent = approval.intent;
     const adapter = new StellarAdapter(this.horizonUrl);
 
@@ -351,6 +382,9 @@ export class TransactionPipeline {
         tx = await this.builder.buildPayment(sourceAccount, intent as any, this.signer.getNetworkPassphrase());
       }
     } catch (e: any) {
+      if (options?.signal?.aborted || e?.name === "AbortError") {
+        throw e;
+      }
       await this.approvalStore.update(approvalId, { status: "failed", error: e.message });
       return {
         status: "rejected",
@@ -361,6 +395,7 @@ export class TransactionPipeline {
       };
     }
 
+    checkAbort();
     const simResult = await this.simulator.simulate(tx);
     if (!simResult.success) {
       await this.approvalStore.update(approvalId, { status: "failed", error: simResult.error ?? "Simulation failed" });
@@ -373,10 +408,14 @@ export class TransactionPipeline {
       };
     }
 
+    checkAbort();
     let signedTx;
     try {
       signedTx = await this.signer.sign(tx);
     } catch (e: any) {
+      if (options?.signal?.aborted || e?.name === "AbortError") {
+        throw e;
+      }
       await this.approvalStore.update(approvalId, { status: "failed", error: e.message });
       return {
         status: "rejected",
@@ -387,12 +426,25 @@ export class TransactionPipeline {
       };
     }
 
+    // Mirror execute(): run the onBeforeSubmit hook, then re-check abort,
+    // immediately before submission.
+    await options?.onBeforeSubmit?.();
+    checkAbort();
+
     // PERSIST txHash BEFORE submit to survive crash window
     const preSubmitHash = signedTx.hash().toString("hex");
 
     try {
       const result = await this.submitter.submit(signedTx, this.signer.getNetworkPassphrase());
-      await this.approvalStore.update(approvalId, { status: "submitted", txHash: result.hash, approvedAt: new Date().toISOString(), approver: approver ?? null });
+      // Only overwrite the approver when one was explicitly passed (the
+      // queue path has none — the approver recorded at approve time must
+      // survive). Previously `approver ?? null` wiped it.
+      await this.approvalStore.update(approvalId, {
+        status: "submitted",
+        txHash: result.hash,
+        approvedAt: new Date().toISOString(),
+        ...(approver !== undefined ? { approver } : {}),
+      });
       if (approval.activityId) {
         const existing = await this.activityStore.get(approval.activityId);
         if (existing) {
@@ -405,9 +457,13 @@ export class TransactionPipeline {
         policyDecision: currentDecision,
         simulationResult: simResult,
         txHash: result.hash,
+        submittedHash: result.hash,
         activityId: approval.activityId,
       };
     } catch (e: any) {
+      if (options?.signal?.aborted || e?.name === "AbortError") {
+        throw e;
+      }
       await this.approvalStore.update(approvalId, { status: "failed", error: e.message });
       return {
         status: "rejected",
