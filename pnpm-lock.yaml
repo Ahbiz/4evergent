@@ -151,6 +151,9 @@ importers:
       '@4evergent/shared':
         specifier: workspace:*
         version: link:../shared
+      '@stellar/stellar-sdk':
+        specifier: ^13.0.0
+        version: 13.3.0
     devDependencies:
       tsx:
         specifier: ^4.19.2

@@ -19,7 +19,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@4evergent/shared": "workspace:*"
+    "@4evergent/shared": "workspace:*",
+    "@stellar/stellar-sdk": "^13.0.0"
   },
   "devDependencies": {
     "tsx": "^4.19.2",

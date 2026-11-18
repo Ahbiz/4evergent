@@ -3,8 +3,12 @@ import assert from "node:assert/strict";
 import { IntentValidator } from "../src/index.js";
 import type { AgentIntent } from "@4evergent/shared";
 
+// A real 56-char StrKey ed25519 public key (checksum-valid). Placeholder
+// addresses such as "GABCDEF" no longer pass validation.
+const VALID_ACCOUNT = "GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U";
+
 const mkPayment = (over: Partial<AgentIntent> = {}): AgentIntent =>
-  ({ type: "payment", asset: "XLM", destination: "GABCDEF", amount: "10", reason: "test payment", ...over }) as AgentIntent;
+  ({ type: "payment", asset: "XLM", destination: VALID_ACCOUNT, amount: "10", reason: "test payment", ...over }) as AgentIntent;
 
 test("valid payment passes validation", () => {
   const r = IntentValidator.validate(mkPayment());
@@ -55,10 +59,113 @@ test("valid trustline passes", () => {
   const r = IntentValidator.validate({
     type: "trustline",
     assetCode: "USDC",
+    issuer: VALID_ACCOUNT,
+    limit: "100",
+    reason: "need USDC",
+  });
+  assert.equal(r.valid, true);
+});
+
+// NOTE: this test previously asserted that issuer "GUSDC" (5 chars, not a
+// valid Stellar address) PASSED validation. That was the bug: the validator
+// only checked startsWith("G"), so the value survived until `new Asset(...)`
+// rejected it at build time. It must now be rejected at the semantic gate.
+test("trustline with 5-char issuer fails", () => {
+  const r = IntentValidator.validate({
+    type: "trustline",
+    assetCode: "USDC",
     issuer: "GUSDC",
     limit: "100",
     reason: "need USDC",
   });
+  assert.equal(r.valid, false);
+  assert.match(r.error!, /issuer/);
+});
+
+test("trustline with space in assetCode fails", () => {
+  const r = IntentValidator.validate({
+    type: "trustline",
+    assetCode: "WITH SPACE",
+    issuer: VALID_ACCOUNT,
+    reason: "need asset",
+  });
+  assert.equal(r.valid, false);
+  assert.match(r.error!, /assetCode/);
+});
+
+test("trustline with 13-char assetCode fails", () => {
+  const r = IntentValidator.validate({
+    type: "trustline",
+    assetCode: "ABCDEFGHIJKLM",
+    issuer: VALID_ACCOUNT,
+    reason: "need asset",
+  });
+  assert.equal(r.valid, false);
+  assert.match(r.error!, /assetCode/);
+});
+
+test("trustline with punctuation in assetCode fails", () => {
+  const r = IntentValidator.validate({
+    type: "trustline",
+    assetCode: "ASSET!",
+    issuer: VALID_ACCOUNT,
+    reason: "need asset",
+  });
+  assert.equal(r.valid, false);
+  assert.match(r.error!, /assetCode/);
+});
+
+test("trustline with empty assetCode fails", () => {
+  const r = IntentValidator.validate({
+    type: "trustline",
+    assetCode: "",
+    issuer: VALID_ACCOUNT,
+    reason: "need asset",
+  });
+  assert.equal(r.valid, false);
+  assert.match(r.error!, /assetCode/);
+});
+
+test("trustline with 56-char non-G issuer fails", () => {
+  const r = IntentValidator.validate({
+    type: "trustline",
+    assetCode: "USDC",
+    issuer: "XDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U",
+    reason: "need USDC",
+  });
+  assert.equal(r.valid, false);
+  assert.match(r.error!, /issuer/);
+});
+
+test("trustline with 56-char bad-checksum issuer fails", () => {
+  const r = IntentValidator.validate({
+    type: "trustline",
+    assetCode: "USDC",
+    issuer: "GDUWFOAXXMRMVR4A5P2FVUKWJOHMLB7CI7T6U4CUVDGAMWYKRJWHBH7H",
+    reason: "need USDC",
+  });
+  assert.equal(r.valid, false);
+  assert.match(r.error!, /issuer/);
+});
+
+test("payment with short destination fails", () => {
+  const r = IntentValidator.validate(mkPayment({ destination: "GDEST" }));
+  assert.equal(r.valid, false);
+  assert.match(r.error!, /Stellar/);
+});
+
+test("payment with non-native assetDetails and invalid issuer fails", () => {
+  const r = IntentValidator.validate(
+    mkPayment({ asset: "USDC", assetDetails: { code: "USDC", issuer: "GUSDC" } } as Partial<AgentIntent>)
+  );
+  assert.equal(r.valid, false);
+  assert.match(r.error!, /asset/);
+});
+
+test("payment with non-native assetDetails and valid issuer passes", () => {
+  const r = IntentValidator.validate(
+    mkPayment({ asset: "USDC", assetDetails: { code: "USDC", issuer: VALID_ACCOUNT } } as Partial<AgentIntent>)
+  );
   assert.equal(r.valid, true);
 });
 

@@ -24,7 +24,7 @@ function makeAgent(id: string, ownerId: string) {
     displayName: "Test Agent",
     description: "test agent",
     ownerId,
-    stellarAddress: "GDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    stellarAddress: "GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U",
     capabilities: [],
     status: "active" as const,
     createdAt: new Date().toISOString(),
@@ -565,7 +565,7 @@ test("POLICY: queued execution re-evaluates current policy (strictened policy de
       body: JSON.stringify({
         type: "payment",
         asset: "XLM",
-        destination: "GDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        destination: "GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U",
         amount: "100",
         reason: "execution-time policy test",
       }),

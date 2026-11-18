@@ -17,7 +17,7 @@ declare const fetch: typeof globalThis.fetch;
 const TEST_INTENT = {
   type: "payment" as const,
   asset: "XLM",
-  destination: "GDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  destination: "GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U",
   amount: "10",
   reason: "dashboard endpoint test",
 };
@@ -103,7 +103,7 @@ async function startServer(opts: {
       displayName: "Dashboard Test Agent",
       description: "dashboard endpoint fixture",
       ownerId: "owner-a",
-      stellarAddress: "GDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      stellarAddress: "GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U",
       capabilities: ["payment"],
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),

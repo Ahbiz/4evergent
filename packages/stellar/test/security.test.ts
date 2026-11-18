@@ -113,8 +113,13 @@ test("SEC: unauthorized destination cannot reach signer", async () => {
   const { pipeline, signer } = makePipeline({
     rules: { allowedDestinations: ["GONLYTHISONE"] },
   });
+  // The destination must be a valid Stellar address so the intent passes the
+  // IntentValidator gate and this test exercises the POLICY allowlist, not
+  // validation. (A malformed destination would be rejected earlier with a
+  // validation error, which also matches /destination/i but proves nothing
+  // about the allowlist.)
   const result = await pipeline.execute({
-    intent: paymentIntent("1", "GEVILDESTINATION"),
+    intent: paymentIntent("1", Keypair.random().publicKey()),
     sourceAccount: fakeAccount(),
   });
   assert.equal(result.status, "rejected");

@@ -102,7 +102,7 @@ export const DEFAULT_TEST_AGENT = {
   displayName: "Test Agent",
   description: "test agent",
   ownerId: "test",
-  stellarAddress: "GDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  stellarAddress: "GDI73WJ4SX7LOG3XZDJC3KCK6ED6E5NBYK2JUBQSPBCNNWEG3ZN7T75U",
   capabilities: ["payment"],
   status: "active" as const,
   createdAt: new Date().toISOString(),
