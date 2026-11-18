@@ -271,6 +271,24 @@ The background workers poll on fixed intervals that can be tuned with environmen
 
 A faster reconciliation loop is handy for a testnet demo; a slower one reduces Horizon load. The startup log lines (`[reconciler] started, interval: ...`) show the effective value.
 
+## Transaction fees
+
+Every transaction the pipeline builds carries one configured base fee
+(`StellarTransactionBuilder`, `packages/stellar/src/transaction-builder.ts`):
+
+| Source | Value |
+| --- | --- |
+| Constructor option `baseFeeStroops` | overrides everything |
+| `STELLAR_BASE_FEE` env var (see `.env.example`) | overrides the default |
+| Default | `100` stroops — the Stellar network base fee |
+
+Previously each builder hardcoded `100000` stroops (0.01 XLM, 1000x the base
+fee). A configured value must be a positive integer number of stroops; an
+invalid value fails fast at startup. This is a static configured fee only —
+no dynamic surge pricing. The simulator still enforces `fee >=` the live
+network base fee fetched from Horizon, so a configured fee below the network
+base fee fails simulation instead of submitting.
+
 ## Safety Guards (Phase 21)
 
 - **Network validation**: Only Testnet URL + passphrase accepted. Mainnet explicitly rejected.

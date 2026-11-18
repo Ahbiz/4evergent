@@ -63,6 +63,16 @@ export interface ApprovalStore {
   countByOwner(ownerId: string, status?: string): Promise<number>;
   getForOwner(id: string, ownerId: string): Promise<ApprovalRecord | null>;
   update(id: string, patch: Partial<ApprovalRecord>): Promise<ApprovalRecord | null>;
+  /**
+   * Atomic compare-and-swap: apply `patch` only if the record's current
+   * status is `expectedStatus`, else return null without changing anything.
+   * The claim (pending_approval → approved / rejected) in the API approve /
+   * reject handlers goes through this so two concurrent decisions cannot both
+   * win: exactly one claimer gets the record, the loser gets null (→ 409).
+   * InMemory checks-and-sets synchronously; SQLite does it in a single
+   * conditional UPDATE ... WHERE status = ? statement.
+   */
+  updateIfStatus(id: string, expectedStatus: ApprovalStatus, patch: Partial<ApprovalRecord>): Promise<ApprovalRecord | null>;
 }
 
 export type ApprovalStatus =
@@ -299,6 +309,14 @@ export class InMemoryApprovalStore implements ApprovalStore {
     const existing = this.records.get(id);
     if (!existing) return null;
     const updated = { ...existing, ...patch, updatedAt: new Date().toISOString() };
+    this.records.set(id, updated);
+    return updated;
+  }
+
+  async updateIfStatus(id: string, expectedStatus: ApprovalStatus, patch: Partial<ApprovalRecord>): Promise<ApprovalRecord | null> {
+    const existing = this.records.get(id);
+    if (!existing || existing.status !== expectedStatus) return null;
+    const updated = { ...existing, ...patch, id: existing.id, updatedAt: new Date().toISOString() };
     this.records.set(id, updated);
     return updated;
   }

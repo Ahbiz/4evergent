@@ -21,6 +21,9 @@ export interface PipelineOptions {
   approvalStore?: ApprovalStore;
   policyRules?: Partial<PolicyRules>;
   approvalTtlSeconds?: number;
+  /** Base fee (stroops) for transactions built by this pipeline. Overrides
+   *  STELLAR_BASE_FEE; when omitted the builder defaults to 100 stroops. */
+  baseFeeStroops?: string;
   /** Shared policy resolver. When provided, pipeline resolves per-agent rules at execution time. */
   policyResolver?: (agentId: string) => Promise<PolicyRules>;
 }
@@ -61,7 +64,9 @@ export class TransactionPipeline {
   private policyResolver?: (agentId: string) => Promise<PolicyRules>;
 
   constructor(options: PipelineOptions) {
-    this.builder = new StellarTransactionBuilder();
+    this.builder = new StellarTransactionBuilder(
+      options.baseFeeStroops !== undefined ? { baseFeeStroops: options.baseFeeStroops } : {}
+    );
     this.simulator = new StellarSimulator(options.horizonUrl);
     this.submitter = new StellarSubmitter(options.horizonUrl);
     this.signer = options.signer;
@@ -336,12 +341,29 @@ export class TransactionPipeline {
     // skipReservation: daily spending was already reserved at intent-creation time.
     // Re-evaluating here must NOT double-reserve.
     checkAbort();
-    const currentDecision = await this.policy.evaluate(approval.intent, approval.agentId, { skipReservation: true });
-    if (currentDecision.result === "deny") {
-      await this.approvalStore.update(approvalId, { status: "failed", error: `Policy re-evaluation denied: ${currentDecision.reason}` });
+    // skipApprovalThreshold: the approval being executed IS the satisfaction of
+    // the threshold gate, so it must not re-trigger requires_approval for the
+    // approved amount. Every other check (allowlist, max amount, daily limit,
+    // tx type) still applies, and anything that is not a clean `allow` blocks
+    // execution. FAIL-CLOSED, no silent re-queue: the approval is moved to
+    // terminal `failed` and the operator must create a fresh intent/approval
+    // if the payment is still wanted. Re-queueing would resurrect a stale
+    // approval the operator may already have acted on and risks a duplicate
+    // submission. The deny/allowlist reason is stored in approval.error and
+    // the linked activity error so it surfaces in the API response.
+    const currentDecision = await this.policy.evaluate(approval.intent, approval.agentId, { skipReservation: true, skipApprovalThreshold: true });
+    if (currentDecision.result !== "allow") {
+      const reason = `Policy re-evaluation did not allow execution: ${currentDecision.reason} (rule: ${currentDecision.rule})`;
+      await this.approvalStore.update(approvalId, { status: "failed", error: reason });
+      if (approval.activityId) {
+        const existing = await this.activityStore.get(approval.activityId);
+        if (existing) {
+          await this.activityStore.update(approval.activityId, { status: "failed", error: reason });
+        }
+      }
       return {
         status: "rejected",
-        message: `Policy re-evaluation denied: ${currentDecision.reason}`,
+        message: reason,
         policyDecision: currentDecision,
         simulationResult: null,
         activityId: approval.activityId,
@@ -431,8 +453,12 @@ export class TransactionPipeline {
     await options?.onBeforeSubmit?.();
     checkAbort();
 
-    // PERSIST txHash BEFORE submit to survive crash window
+    // PERSIST txHash BEFORE submit to survive crash window.
+    // The approval record carries the pre-submit hash so the approval
+    // recovery sweeper (#376) can check on-chain whether this transaction
+    // landed even if the process dies between submit and the status update.
     const preSubmitHash = signedTx.hash().toString("hex");
+    await this.approvalStore.update(approvalId, { txHash: preSubmitHash });
 
     try {
       const result = await this.submitter.submit(signedTx, this.signer.getNetworkPassphrase());
@@ -464,7 +490,7 @@ export class TransactionPipeline {
       if (options?.signal?.aborted || e?.name === "AbortError") {
         throw e;
       }
-      await this.approvalStore.update(approvalId, { status: "failed", error: e.message });
+      await this.approvalStore.update(approvalId, { status: "failed", error: e.message, txHash: preSubmitHash });
       return {
         status: "rejected",
         message: `Submission failed: ${e.message}`,

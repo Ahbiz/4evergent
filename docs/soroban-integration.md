@@ -39,6 +39,11 @@ const tx = new TransactionBuilder(account, { fee: "100", networkPassphrase: Netw
   .addOperation(contract.call("query", nativeToScVal("deploy_smoke")))
   .build();
 
+// NOTE: fee "100" here is the Stellar network base fee (100 stroops). The
+// pipeline's transaction builder uses the same single fee source by default
+// (see STELLAR_BASE_FEE in .env.example and docs/testnet.md "Transaction
+// fees") — it no longer hardcodes 100000 stroops.
+
 const sim = await server.simulateTransaction(tx);
 
 // simulateTransaction returns a union. An unsuccessful simulation is NOT a
