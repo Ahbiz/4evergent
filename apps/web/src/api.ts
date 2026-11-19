@@ -4,17 +4,20 @@
 const API_BASE = import.meta.env.VITE_API_BASE?.trim() || 'http://localhost:3000';
 import { getStoredToken, clearAuth } from './auth';
 
-export class ApiError extends Error {
+export class ApiError<T = unknown> extends Error {
   status: number;
   /** Machine-readable error code from the API; 'UNKNOWN' when the server sent none. */
   code: string;
   details?: unknown;
-  constructor(status: number, message: string, code = 'UNKNOWN', details?: unknown) {
+  /** Preserved raw or parsed response body if server returned JSON */
+  responseBody?: T;
+  constructor(status: number, message: string, code = 'UNKNOWN', details?: unknown, responseBody?: T) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.code = code;
     this.details = details;
+    this.responseBody = responseBody;
   }
 }
 
@@ -49,7 +52,7 @@ async function request<T>(path: string, init?: RequestInit & { skipAuthClear?: b
     if (res.status === 401 && !skipAuthClear) {
       clearAuth();
     }
-    throw new ApiError(res.status, message, body?.code ?? 'UNKNOWN', body?.details);
+    throw new ApiError(res.status, message, body?.code ?? 'UNKNOWN', body?.details, body ?? undefined);
   }
   return body as T;
 }

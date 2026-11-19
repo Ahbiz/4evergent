@@ -1,6 +1,7 @@
 import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import { test, expect, describe, vi, beforeEach } from 'vitest';
 import { MemoryRouter } from 'react-router-dom';
+import { ApiError } from '../../api';
 
 const { mockSubmitPayment, mockSubmitTrustline, mockListAllAgents } = vi.hoisted(() => ({
   mockSubmitPayment: vi.fn(),
@@ -8,13 +9,17 @@ const { mockSubmitPayment, mockSubmitTrustline, mockListAllAgents } = vi.hoisted
   mockListAllAgents: vi.fn(),
 }));
 
-vi.mock('../../api', () => ({
-  api: {
-    listAllAgents: mockListAllAgents,
-    submitPayment: mockSubmitPayment,
-    submitTrustline: mockSubmitTrustline,
-  },
-}));
+vi.mock('../../api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../api')>();
+  return {
+    ...actual,
+    api: {
+      listAllAgents: mockListAllAgents,
+      submitPayment: mockSubmitPayment,
+      submitTrustline: mockSubmitTrustline,
+    },
+  };
+});
 
 import Submit from '../Submit';
 
@@ -187,5 +192,113 @@ describe('Submit', () => {
       'agent-1',
       expect.objectContaining({ asset: 'USDC' })
     );
+  });
+
+  test('a 403 deny renders the policy decision reason and the activity link', async () => {
+    const errorBody = {
+      activityId: 'act-deny-123',
+      agentId: 'agent-1',
+      status: 'rejected',
+      error: 'Transaction exceeds daily limit',
+      policyDecision: {
+        result: 'deny',
+        reason: 'amount exceeds daily limit',
+        rule: 'dailySpendingLimit',
+      },
+    };
+    mockSubmitPayment.mockRejectedValue(
+      new ApiError(403, 'Transaction exceeds daily limit', 'POLICY_DENIED', undefined, errorBody)
+    );
+
+    renderSubmit();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText('Agent')).toBeInTheDocument();
+    });
+
+    fireEvent.change(screen.getByLabelText('Amount'), { target: { value: '10' } });
+    fireEvent.change(screen.getByLabelText('Destination (Stellar G...)'), { target: { value: 'GABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQ' } });
+    fireEvent.change(screen.getByLabelText('Reason'), { target: { value: 'Large payment' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Submit Intent' }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toBeInTheDocument();
+    });
+
+    const alertBanner = screen.getByRole('alert');
+    expect(alertBanner).toHaveClass('error-banner');
+    expect(alertBanner).toHaveTextContent('amount exceeds daily limit');
+    expect(alertBanner).toHaveTextContent('act-deny-123');
+
+    const activityLink = screen.getByText('View activity');
+    expect(activityLink).toBeInTheDocument();
+    expect(activityLink.closest('a')).toHaveAttribute(
+      'href',
+      '/agents/agent-1/activity/act-deny-123'
+    );
+  });
+
+  test('a 422 simulation failure renders the failure and the activity link', async () => {
+    const errorBody = {
+      activityId: 'act-sim-456',
+      agentId: 'agent-1',
+      status: 'simulation_failed',
+      error: 'Simulation failed: op_underfunded',
+      simulationResult: { success: false, error: 'op_underfunded' },
+    };
+    mockSubmitPayment.mockRejectedValue(
+      new ApiError(422, 'Simulation failed: op_underfunded', 'SIMULATION_FAILED', undefined, errorBody)
+    );
+
+    renderSubmit();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText('Agent')).toBeInTheDocument();
+    });
+
+    fireEvent.change(screen.getByLabelText('Amount'), { target: { value: '10' } });
+    fireEvent.change(screen.getByLabelText('Destination (Stellar G...)'), { target: { value: 'GABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQ' } });
+    fireEvent.change(screen.getByLabelText('Reason'), { target: { value: 'Payment' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Submit Intent' }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toBeInTheDocument();
+    });
+
+    const alertBanner = screen.getByRole('alert');
+    expect(alertBanner).toHaveClass('error-banner');
+    expect(alertBanner).toHaveTextContent('Simulation failed: op_underfunded');
+    expect(alertBanner).toHaveTextContent('act-sim-456');
+
+    const activityLink = screen.getByText('View activity');
+    expect(activityLink).toBeInTheDocument();
+    expect(activityLink.closest('a')).toHaveAttribute(
+      'href',
+      '/agents/agent-1/activity/act-sim-456'
+    );
+  });
+
+  test('a network failure with no body renders as today without activity link', async () => {
+    mockSubmitPayment.mockRejectedValue(new Error('Failed to fetch'));
+
+    renderSubmit();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText('Agent')).toBeInTheDocument();
+    });
+
+    fireEvent.change(screen.getByLabelText('Amount'), { target: { value: '10' } });
+    fireEvent.change(screen.getByLabelText('Destination (Stellar G...)'), { target: { value: 'GABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQ' } });
+    fireEvent.change(screen.getByLabelText('Reason'), { target: { value: 'Payment' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Submit Intent' }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toBeInTheDocument();
+    });
+
+    const alertBanner = screen.getByRole('alert');
+    expect(alertBanner).toHaveClass('error-banner');
+    expect(alertBanner).toHaveTextContent('Failed to fetch');
+    expect(screen.queryByText('View activity')).not.toBeInTheDocument();
   });
 });
