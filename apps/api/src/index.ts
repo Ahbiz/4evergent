@@ -18,8 +18,7 @@ import { ScheduleExecutionService } from "./schedule-execution.js";
 import { ExecutionQueue } from "./execution-queue.js";
 import { ExecutionRecoveryService } from "./execution-recovery.js";
 import { ScheduleRecoveryService } from "./schedule-recovery.js";
-import { TransactionStatusReconciler } from "@4evergent/stellar";
-import { ApprovalRecoveryService } from "@4evergent/stellar";
+import { TransactionStatusReconciler, ApprovalRecoveryService, DEFAULT_SUBMITTED_MAX_AGE_MS } from "@4evergent/stellar";
 import { AccountSequenceCoordinator } from "./account-sequence-coordinator.js";
 import type { ExecutionRecord, ExecutionStatus } from "@4evergent/database";
 import type { ScheduleExecutionResult } from "./schedule-execution.js";
@@ -51,6 +50,7 @@ import {
   type PolicyConfigStore,
   createActivity,
   isOffsetAtCeiling,
+  clampOffset,
 } from "@4evergent/database";
 import type { PolicyRules, Agent, RequestContext, AuthorizationService, AuthProvider, AuthenticatedPrincipal } from "@4evergent/shared";
 import { createAuthModule, type PrincipalResolution } from "./auth.js";
@@ -165,6 +165,8 @@ export interface ServerOptions {
   reconciliation?: {
     enabled?: boolean;
     intervalMs?: number;
+    /** Max age of a `submitted` execution still `not_found` before it is retired to `failed`. */
+    maxAgeMs?: number;
     instance?: import("@4evergent/stellar").TransactionStatusReconciler;
   };
   /** Recover approvals stuck in `executing` after a crash (#376).
@@ -259,6 +261,60 @@ export async function createApiServer(options: ServerOptions) {
 
   // Phase 28J: PolicyEngine in API uses the SAME resolver
   const policy = new PolicyEngine(options.policyRules, store as any, getRules);
+
+  /**
+   * Release the daily-spending reservation recorded on a policy decision
+   * (#353). No-op when the decision reserved nothing. Used by handlers for
+   * the paths the pipeline never runs (source-account load failure,
+   * approval reject/expiry), where the pipeline's own release cannot fire.
+   */
+  async function releaseDecisionReservation(agentId: string, decision: PolicyDecision | null | undefined): Promise<void> {
+    const reserved = decision?.reservedDailySpending;
+    if (!reserved) return;
+    try {
+      await store.releaseDailySpending(agentId, reserved.asset, reserved.amount);
+    } catch {
+      // Best-effort bookkeeping; the stale row is swept at the day boundary.
+    }
+  }
+
+  /**
+   * Per-key in-flight lock (#371). Serializes intent handling per
+   * (owner, agent, Idempotency-Key) for the whole request duration.
+   *
+   * WHY A LOCK, NOT AN EARLY PENDING RECORD: recording a pending activity
+   * before policy evaluation would need a placeholder decision (the real
+   * one does not exist yet), and that placeholder would leak into the
+   * activity log if evaluation then denied. The lock instead makes the
+   * second concurrent request wait, then hit the pre-check in
+   * handleIntentExecute and replay the first request's record — so it
+   * never evaluates policy and never reserves daily spending a second
+   * time, composing cleanly with #353's single-reservation rule.
+   *
+   * SCOPE: one server process. Requests without a key bypass the lock
+   * entirely. Cross-process duplicates (two server instances sharing one
+   * SQLite file) still rely on the store-level `recordIdempotent` atomic
+   * reservation plus the pipeline's no-overwrite rule (#371 defense in
+   * depth); the lock is the guard for the single-process deployment this
+   * server runs as.
+   */
+  const idempotencyLocks = new Map<string, Promise<void>>();
+  async function withIdempotencyKeyLock<T>(scopeKey: string, fn: () => Promise<T>): Promise<T> {
+    const prev = idempotencyLocks.get(scopeKey) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const chained = prev.then(() => current);
+    idempotencyLocks.set(scopeKey, chained);
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (idempotencyLocks.get(scopeKey) === chained) idempotencyLocks.delete(scopeKey);
+    }
+  }
   const adapter = new StellarAdapter(options.horizonUrl);
 
   const readinessTimeoutMs = options.readiness?.timeoutMs ?? 2_000;
@@ -428,12 +484,17 @@ export async function createApiServer(options: ServerOptions) {
       options.reconciliation.instance ??
       new TransactionStatusReconciler(executionStore, statusProvider, {
         intervalMs: options.reconciliation.intervalMs,
+        maxAgeMs: options.reconciliation.maxAgeMs,
+        // #276: release the daily-spending reservation of a retired
+        // execution, when the record proves one was made (#353).
+        activityStore: store,
       });
     reconciler.start();
     console.log("[reconciler] started, interval:", options.reconciliation.intervalMs ?? 30_000, "ms");
     // Periodic stuck-approval sweep rides on the reconciliation lifecycle.
     approvalRecovery.start();
     console.log("[approval-recovery] started, interval:", options.approvalRecovery?.intervalMs ?? 60_000, "ms");
+    console.log("[reconciler] not_found max age:", options.reconciliation.maxAgeMs ?? DEFAULT_SUBMITTED_MAX_AGE_MS, "ms");
   }
 
   if (options.executionQueue?.enabled) {
@@ -981,6 +1042,8 @@ export async function createApiServer(options: ServerOptions) {
     const capability = urlObj.searchParams.get("capability");
     const hasLimit = urlObj.searchParams.has("limit");
     const rawLimit = urlObj.searchParams.get("limit");
+    const hasOffset = urlObj.searchParams.has("offset");
+    const rawOffset = urlObj.searchParams.get("offset");
 
     let limit: number | undefined;
     if (hasLimit) {
@@ -995,9 +1058,31 @@ export async function createApiServer(options: ServerOptions) {
       limit = Math.max(1, Math.min(MAX_LIMIT, parsed));
     }
 
-    const all = capability !== null
-      ? await agentStore.listByCapability(ctx.ownerId!, capability, limit)
-      : await agentStore.listByOwner(ctx.ownerId!, limit);
+    // Same strict validation as `limit`: empty, non-numeric, or fractional
+    // values are rejected. A negative offset clamps to 0 and an offset past
+    // MAX_OFFSET clamps to MAX_OFFSET (see clampOffset).
+    let offset = 0;
+    if (hasOffset) {
+      if (rawOffset === null || rawOffset.trim() === "") {
+        return apiError(res, "VALIDATION_ERROR", { message: "offset must be a valid integer" });
+      }
+      const parsed = Number(rawOffset);
+      if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) {
+        return apiError(res, "VALIDATION_ERROR", { message: "offset must be a valid integer" });
+      }
+      offset = clampOffset(parsed);
+    }
+
+    const effectiveLimit = limit ?? MAX_LIMIT;
+    const [all, total] = capability !== null
+      ? [
+          await agentStore.listByCapability(ctx.ownerId!, capability, effectiveLimit, offset),
+          await agentStore.countByCapability(ctx.ownerId!, capability),
+        ]
+      : [
+          await agentStore.listByOwner(ctx.ownerId!, effectiveLimit, offset),
+          await agentStore.countByOwner(ctx.ownerId!),
+        ];
 
     const agentList = all.map((a) => ({
       id: a.id,
@@ -1010,7 +1095,12 @@ export async function createApiServer(options: ServerOptions) {
       active: a.active,
       createdAt: a.createdAt,
     }));
-    return json(res, { agents: agentList });
+    // Same semantics as GET /approvals: `truncated` means more matching rows
+    // exist beyond this page; `hasMore` additionally requires the client to
+    // actually be able to fetch them (offset ceiling ends pagination).
+    const truncated = offset + agentList.length < total;
+    const hasMore = truncated && !isOffsetAtCeiling(offset);
+    return json(res, { agents: agentList, hasMore, truncated, total });
   }
 
   async function handleCreateAgent(ctx: RequestContext, req: any, res: any) {
@@ -1653,6 +1743,23 @@ export async function createApiServer(options: ServerOptions) {
       if (idempotencyKey.length > 256) {
         return apiError(res, "IDEMPOTENCY_KEY_INVALID");
       }
+    }
+
+    // #371: serialize per (owner, agent, key) for the whole request. A
+    // concurrent duplicate waits here, then the pre-check inside
+    // handleIntentExecute replays the first request's record instead of
+    // evaluating policy and executing a second time. Keyless requests
+    // bypass the lock entirely.
+    if (!idempotencyKey) {
+      return handleIntentExecute(ctx, req, res, agentId, intent, null);
+    }
+    return withIdempotencyKeyLock(`${ctx.ownerId}:${agentId}:${idempotencyKey}`, () =>
+      handleIntentExecute(ctx, req, res, agentId, intent, idempotencyKey)
+    );
+  }
+
+  async function handleIntentExecute(ctx: RequestContext, req: any, res: any, agentId: string, intent: AgentIntent, idempotencyKey: string | null) {
+    if (idempotencyKey) {
       const existing = await store.getByIdempotencyKey(ctx.ownerId!, agentId, idempotencyKey);
       if (existing) {
         // Same key + different intent → conflict
@@ -1669,13 +1776,13 @@ export async function createApiServer(options: ServerOptions) {
     const decision = await policy.evaluate(intent, agentId);
 
     if (decision.result === "deny") {
-      const outcome = await pipeline.execute({ intent, sourceAccount: { agentId, ownerId: ctx.ownerId } as any, idempotencyKey });
+      const outcome = await pipeline.execute({ intent, sourceAccount: { agentId, ownerId: ctx.ownerId } as any, idempotencyKey, policyDecision: decision });
       const denied = outcome.activityId ? await store.get(outcome.activityId) : null;
       return json(res, toIntentResponse(denied!), 403);
     }
 
     if (decision.result === "requires_approval") {
-      const outcome = await pipeline.execute({ intent, sourceAccount: { agentId, ownerId: ctx.ownerId } as any, idempotencyKey });
+      const outcome = await pipeline.execute({ intent, sourceAccount: { agentId, ownerId: ctx.ownerId } as any, idempotencyKey, policyDecision: decision });
       if (outcome.status === "requires_approval" && outcome.activityId) {
         const pending = await store.get(outcome.activityId);
         assertNoSecrets(pending!);
@@ -1709,10 +1816,15 @@ export async function createApiServer(options: ServerOptions) {
           ownerId: ctx.ownerId!,
         };
       } catch (e) {
+        // #353: the pipeline never ran, so it cannot release the reservation
+        // made by policy.evaluate() above — release it here before throwing.
+        await releaseDecisionReservation(agentId, decision);
         throw new Error(`Unable to load source account: ${(e as Error).message}`);
       }
 
-      return pipeline.execute({ intent, sourceAccount, idempotencyKey });
+      // #353: pass the handler's decision — the pipeline must NOT
+      // re-evaluate (that would reserve daily spending a second time).
+      return pipeline.execute({ intent, sourceAccount, idempotencyKey, policyDecision: decision });
     }).catch((e: any) => {
       return { status: "failed", message: e?.message ?? "Unknown error" } as any;
     });
@@ -1789,6 +1901,9 @@ export async function createApiServer(options: ServerOptions) {
 
     if (approval.expiresAt && new Date(approval.expiresAt) < new Date()) {
       await approvals.update(approvalId, { status: "expired", expiredAt: new Date().toISOString() });
+      // #353: expired approval will never execute — release the reservation
+      // made when the intent was created.
+      await releaseDecisionReservation(approval.agentId, approval.policyDecision);
       return approvalError(res, "APPROVAL_EXPIRED", { approvalId, activityId: approval.activityId, status: "expired", message: "approval expired" });
     }
 
@@ -1886,6 +2001,9 @@ export async function createApiServer(options: ServerOptions) {
       return approvalError(res, "APPROVAL_CONFLICT", { approvalId, activityId: approval.activityId, status: current?.status ?? approval.status, message: `approval already decided (now ${current?.status ?? approval.status}); refresh before retrying` });
     }
     await store.update(approval.activityId, { status: "rejected", authorizationStatus: "denied_by_policy", error: "approval rejected by human" });
+    // #353: rejected approval will never execute — release the reservation
+    // made when the intent was created.
+    await releaseDecisionReservation(approval.agentId, approval.policyDecision);
 
     return json(res, toApprovalResponse(approvalId, approval.activityId, "rejected", "approval rejected"), 200);
   }

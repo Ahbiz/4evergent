@@ -24,6 +24,12 @@ import { parseStrictAmount } from "./amount.js";
  * Phase 28J: `evaluateWithoutReservation()` performs policy checks without reserving
  * daily spending. Used by executeApproved() to re-evaluate current policy without
  * double-reserving (the reservation was already done at intent-creation time).
+ *
+ * #353: reservation happens at exactly ONE step, AFTER every deny-only check
+ * (amount, tx type, max-tx, allowlists) and BEFORE the approval threshold, so
+ * a denied intent never reserves. A successful reservation is recorded on the
+ * returned PolicyDecision as `reservedDailySpending`; the holder must release
+ * it if the intent never executes (see ActivityStore.releaseDailySpending).
  */
 export interface EvaluateOptions {
   /** Skip daily spending reservation (for re-evaluation in approve path). */
@@ -43,6 +49,9 @@ export class PolicyEngine {
   private activityStore?: {
     listByAgent: (agentId: string, limit?: number) => Promise<ActivityRecord[]>;
     reserveDailySpending?: (agentId: string, asset: string, amount: string, limit: string) => Promise<boolean>;
+    releaseDailySpending?: (agentId: string, asset: string, amount: string) => Promise<void>;
+    /** Reservation-table total for the current UTC day (single source of "spent", #353). */
+    getDailySpending?: (agentId: string, asset: string, now?: Date) => Promise<number | null>;
   };
   private getRules?: (agentId: string) => Promise<PolicyRules | null>;
 
@@ -51,6 +60,8 @@ export class PolicyEngine {
     activityStore?: {
       listByAgent: (agentId: string, limit?: number) => Promise<ActivityRecord[]>;
       reserveDailySpending?: (agentId: string, asset: string, amount: string, limit: string) => Promise<boolean>;
+      releaseDailySpending?: (agentId: string, asset: string, amount: string) => Promise<void>;
+      getDailySpending?: (agentId: string, asset: string, now?: Date) => Promise<number | null>;
     },
     getRules?: (agentId: string) => Promise<PolicyRules | null>
   ) {
@@ -94,6 +105,12 @@ export class PolicyEngine {
     rules: PolicyRules,
     options?: EvaluateOptions
   ): Promise<PolicyDecision> {
+    // #353: set ONLY by a successful daily-spending reservation below.
+    // Attached to every later decision (allow / requires_approval) so the
+    // holder can release exactly this reservation if the intent never
+    // executes. Denies never carry it: allowlist/max-tx checks run BEFORE
+    // the reservation step, and a failed reservation leaves it unset.
+    let reserved: { asset: string; amount: string } | undefined;
     const decide = (
       result: PolicyDecision["result"],
       reason: string,
@@ -103,6 +120,7 @@ export class PolicyEngine {
       reason,
       rule,
       intent,
+      ...(reserved ? { reservedDailySpending: reserved } : {}),
     });
 
     // 0. Amount validation — reject zero, negative, or non-numeric.
@@ -141,37 +159,81 @@ export class PolicyEngine {
       }
     }
 
-    // 3. Daily spending limit (requires persisted activity data)
+    // 3. Asset allowlist
+    // #353: allowlist checks run BEFORE the daily-spending reservation, so
+    // an intent denied here never reserves (previously step 3 reserved first
+    // and the reservation leaked until end of day).
+    if (rules.allowedAssets.length > 0 && !rules.allowedAssets.includes(asset)) {
+      return decide("deny", `Asset '${asset}' is not in allowed_assets`, "allowedAssets");
+    }
+
+    // 4. Destination allowlist (payments only)
+    if (intent.type === "payment" && rules.allowedDestinations.length > 0) {
+      if (!rules.allowedDestinations.includes(intent.destination)) {
+        return decide("deny", `Destination '${intent.destination}' not in allowed_destinations`, "allowedDestinations");
+      }
+    }
+
+    // 5. Contract ID allowlist (contract calls only)
+    if (intent.type === "contract_call" && rules.allowedContractIds.length > 0) {
+      if (!rules.allowedContractIds.includes(intent.contractId)) {
+        return decide("deny", `Contract '${intent.contractId}' not in allowed list`, "allowedContractIds");
+      }
+    }
+
+    // 6. Daily spending limit (requires persisted activity data)
+    // This is the ONLY step that reserves: one evaluate() = at most one
+    // reservation, and only for intents that passed every deny check above.
     if (amountStr !== null && this.activityStore) {
       const dailyLimit = rules.dailySpendingLimit[asset] ?? rules.dailySpendingLimit["native"];
       if (dailyLimit) {
         if (options?.skipReservation) {
           // Skip reservation but still check the limit (read-only).
           // Used by executeApproved to verify tightened policy without double-reserving.
-          const spent = await this.getDailySpent(asset, agentId);
           // A malformed limit can only come from rules that bypassed
           // validatePolicyRules; fall back to NaN so the comparison is
           // false, exactly as the old parseFloat path behaved.
           const limitNum = parseStrictAmount(dailyLimit) ?? Number.NaN;
-          const remaining = limitNum - spent;
-          if ((amountNum as number) > remaining) {
-            return decide(
-              "deny",
-              `Amount ${amountStr} ${asset} exceeds daily limit: spent ${spent.toFixed(7)}, limit ${limitNum}, remaining ${remaining.toFixed(7)}`,
-              "dailySpendingLimit"
-            );
+          // #353: read the reservation table (the same source the spending
+          // endpoint reports), NOT the submitted-activity sum. The table
+          // already includes this intent's own reservation from creation
+          // time, so the check is simply: does the CURRENT limit still
+          // cover everything already reserved? If policy was tightened
+          // below the reserved total, deny.
+          const reservedTotal = await this.getReservedTotal(asset, agentId);
+          if (reservedTotal !== null) {
+            if (reservedTotal > limitNum) {
+              return decide(
+                "deny",
+                `Amount ${amountStr} ${asset} exceeds daily limit: reserved ${reservedTotal.toFixed(7)}, limit ${limitNum}`,
+                "dailySpendingLimit"
+              );
+            }
+          } else {
+            // Store cannot report reservations (e.g. a minimal test double):
+            // fall back to the pre-#353 submitted-activity check.
+            const spent = await this.getDailySpent(asset, agentId);
+            const remaining = limitNum - spent;
+            if ((amountNum as number) > remaining) {
+              return decide(
+                "deny",
+                `Amount ${amountStr} ${asset} exceeds daily limit: spent ${spent.toFixed(7)}, limit ${limitNum}, remaining ${remaining.toFixed(7)}`,
+                "dailySpendingLimit"
+              );
+            }
           }
         } else if (this.activityStore.reserveDailySpending) {
-          const reserved = await this.activityStore.reserveDailySpending(
+          const reservedOk = await this.activityStore.reserveDailySpending(
             agentId, asset, amountStr, dailyLimit
           );
-          if (!reserved) {
+          if (!reservedOk) {
             return decide(
               "deny",
               `Amount ${amountStr} ${asset} exceeds daily limit (atomically reserved failed)`,
               "dailySpendingLimit"
             );
           }
+          reserved = { asset, amount: amountStr };
         } else {
           const spent = await this.getDailySpent(asset, agentId);
           // See the skipReservation branch above for the NaN fallback.
@@ -224,6 +286,19 @@ export class PolicyEngine {
     }
 
     return decide("allow", "All policy checks passed", "default");
+  }
+
+  /**
+   * Reservation-table total for (agent, asset) today (#353) — the same
+   * source the spending endpoint reports. Returns null when the store
+   * cannot report reservations, so callers can fall back to the activity
+   * sum. Only "submitted" activities counted by getDailySpent are NOT used
+   * here: pending approvals hold real reservations and must count.
+   */
+  private async getReservedTotal(asset: string, agentId: string): Promise<number | null> {
+    if (!this.activityStore?.getDailySpending) return null;
+    const total = await this.activityStore.getDailySpending(agentId, asset);
+    return total ?? 0;
   }
 
   /**
