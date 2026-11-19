@@ -259,6 +259,22 @@ export async function createApiServer(options: ServerOptions) {
 
   // Phase 28J: PolicyEngine in API uses the SAME resolver
   const policy = new PolicyEngine(options.policyRules, store as any, getRules);
+
+  /**
+   * Release the daily-spending reservation recorded on a policy decision
+   * (#353). No-op when the decision reserved nothing. Used by handlers for
+   * the paths the pipeline never runs (source-account load failure,
+   * approval reject/expiry), where the pipeline's own release cannot fire.
+   */
+  async function releaseDecisionReservation(agentId: string, decision: PolicyDecision | null | undefined): Promise<void> {
+    const reserved = decision?.reservedDailySpending;
+    if (!reserved) return;
+    try {
+      await store.releaseDailySpending(agentId, reserved.asset, reserved.amount);
+    } catch {
+      // Best-effort bookkeeping; the stale row is swept at the day boundary.
+    }
+  }
   const adapter = new StellarAdapter(options.horizonUrl);
 
   const readinessTimeoutMs = options.readiness?.timeoutMs ?? 2_000;
@@ -1669,13 +1685,13 @@ export async function createApiServer(options: ServerOptions) {
     const decision = await policy.evaluate(intent, agentId);
 
     if (decision.result === "deny") {
-      const outcome = await pipeline.execute({ intent, sourceAccount: { agentId, ownerId: ctx.ownerId } as any, idempotencyKey });
+      const outcome = await pipeline.execute({ intent, sourceAccount: { agentId, ownerId: ctx.ownerId } as any, idempotencyKey, policyDecision: decision });
       const denied = outcome.activityId ? await store.get(outcome.activityId) : null;
       return json(res, toIntentResponse(denied!), 403);
     }
 
     if (decision.result === "requires_approval") {
-      const outcome = await pipeline.execute({ intent, sourceAccount: { agentId, ownerId: ctx.ownerId } as any, idempotencyKey });
+      const outcome = await pipeline.execute({ intent, sourceAccount: { agentId, ownerId: ctx.ownerId } as any, idempotencyKey, policyDecision: decision });
       if (outcome.status === "requires_approval" && outcome.activityId) {
         const pending = await store.get(outcome.activityId);
         assertNoSecrets(pending!);
@@ -1709,10 +1725,15 @@ export async function createApiServer(options: ServerOptions) {
           ownerId: ctx.ownerId!,
         };
       } catch (e) {
+        // #353: the pipeline never ran, so it cannot release the reservation
+        // made by policy.evaluate() above — release it here before throwing.
+        await releaseDecisionReservation(agentId, decision);
         throw new Error(`Unable to load source account: ${(e as Error).message}`);
       }
 
-      return pipeline.execute({ intent, sourceAccount, idempotencyKey });
+      // #353: pass the handler's decision — the pipeline must NOT
+      // re-evaluate (that would reserve daily spending a second time).
+      return pipeline.execute({ intent, sourceAccount, idempotencyKey, policyDecision: decision });
     }).catch((e: any) => {
       return { status: "failed", message: e?.message ?? "Unknown error" } as any;
     });
@@ -1789,6 +1810,9 @@ export async function createApiServer(options: ServerOptions) {
 
     if (approval.expiresAt && new Date(approval.expiresAt) < new Date()) {
       await approvals.update(approvalId, { status: "expired", expiredAt: new Date().toISOString() });
+      // #353: expired approval will never execute — release the reservation
+      // made when the intent was created.
+      await releaseDecisionReservation(approval.agentId, approval.policyDecision);
       return approvalError(res, "APPROVAL_EXPIRED", { approvalId, activityId: approval.activityId, status: "expired", message: "approval expired" });
     }
 
@@ -1886,6 +1910,9 @@ export async function createApiServer(options: ServerOptions) {
       return approvalError(res, "APPROVAL_CONFLICT", { approvalId, activityId: approval.activityId, status: current?.status ?? approval.status, message: `approval already decided (now ${current?.status ?? approval.status}); refresh before retrying` });
     }
     await store.update(approval.activityId, { status: "rejected", authorizationStatus: "denied_by_policy", error: "approval rejected by human" });
+    // #353: rejected approval will never execute — release the reservation
+    // made when the intent was created.
+    await releaseDecisionReservation(approval.agentId, approval.policyDecision);
 
     return json(res, toApprovalResponse(approvalId, approval.activityId, "rejected", "approval rejected"), 200);
   }

@@ -247,19 +247,26 @@ export class SQLiteActivityStore implements ActivityStore {
       return true; // Reservation succeeded
     }
 
-    // UPDATE affected 0 rows — either row doesn't exist or limit exceeded
-    // Try INSERT (row doesn't exist yet — first spend of the day)
+    // UPDATE affected 0 rows — either row doesn't exist or limit exceeded.
+    // #353: check the limit BEFORE inserting. The old code inserted first
+    // and returned false afterwards, persisting an over-limit row that
+    // bricked the asset for the rest of the day.
+    if (amountNum > limitNum) {
+      return false; // First reservation already over limit — persist nothing.
+    }
+
+    // Row doesn't exist yet — first spend of the day, within limit.
     try {
       this.db
         .prepare(
           `INSERT INTO daily_spending (agent_id, asset, day, total) VALUES (?, ?, ?, ?)`
         )
         .run(agentId, asset, day, amountNum);
-      // INSERT succeeded — verify amount doesn't exceed limit
-      return amountNum <= limitNum;
+      return true;
     } catch (_e: any) {
-      // PRIMARY KEY conflict — row was created by concurrent caller between our UPDATE and INSERT
-      // Retry the UPDATE once (the concurrent caller's INSERT committed first)
+      // PRIMARY KEY conflict — row was created by concurrent caller between our UPDATE and INSERT,
+      // or the row exists and the limit would be exceeded. Retry the UPDATE
+      // once (the concurrent caller's INSERT committed first).
       const retryResult = this.db
         .prepare(
           `UPDATE daily_spending SET total = total + ?
@@ -268,6 +275,33 @@ export class SQLiteActivityStore implements ActivityStore {
         .run(amountNum, agentId, asset, day, amountNum, limitNum);
       return retryResult.changes === 1;
     }
+  }
+
+  /**
+   * Release a previously reserved amount (#353). Decrements the day's total,
+   * floored at 0, and removes the row when it reaches 0. Callers MUST only
+   * release amounts proven reserved (PolicyDecision.reservedDailySpending).
+   */
+  async releaseDailySpending(agentId: string, asset: string, amount: string, now = new Date()): Promise<void> {
+    const amountNum = parseFloat(amount);
+    if (isNaN(amountNum) || amountNum <= 0) return;
+
+    const day = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()))
+      .toISOString()
+      .slice(0, 10); // YYYY-MM-DD
+
+    this.db
+      .prepare(
+        `UPDATE daily_spending SET total = MAX(total - ?, 0)
+         WHERE agent_id = ? AND asset = ? AND day = ?`
+      )
+      .run(amountNum, agentId, asset, day);
+    this.db
+      .prepare(
+        `DELETE FROM daily_spending
+         WHERE agent_id = ? AND asset = ? AND day = ? AND total <= 0`
+      )
+      .run(agentId, asset, day);
   }
 
   async getDailySpending(agentId: string, asset: string, now = new Date()): Promise<number | null> {
