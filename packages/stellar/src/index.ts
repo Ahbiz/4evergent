@@ -7,8 +7,8 @@ export { TransactionPipeline } from "./pipeline.js";
 export type { PipelineOptions, PipelineExecuteInput, PipelineOutcome, ExecuteApprovedOptions } from "./pipeline.js";
 
 // Transaction status reconciliation
-export { TransactionStatusReconciler } from "./reconciler.js";
-export type { TransactionStatusProvider, TransactionStatus, ReconciliationResult } from "./reconciler.js";
+export { TransactionStatusReconciler, DEFAULT_SUBMITTED_MAX_AGE_MS } from "./reconciler.js";
+export type { TransactionStatusProvider, TransactionStatus, ReconciliationResult, ReconcilerOptions } from "./reconciler.js";
 
 // Stuck-approval recovery (crash between approval and submission)
 export { ApprovalRecoveryService, STALE_EXECUTING_APPROVAL_MS } from "./approval-recovery.js";
