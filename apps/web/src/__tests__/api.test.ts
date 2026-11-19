@@ -201,6 +201,33 @@ describe('ApiError code', () => {
     const err = await api.getAgent('x').catch((e: unknown) => e);
     expect((err as ApiError).code).toBe('UNKNOWN');
   });
+
+  it('preserves responseBody on ApiError when server sends JSON', async () => {
+    const errorBody = {
+      activityId: 'act-fail-1',
+      agentId: 'agent-1',
+      status: 'rejected',
+      error: 'Daily limit exceeded',
+      policyDecision: {
+        result: 'deny',
+        reason: 'Daily limit exceeded',
+        rule: 'dailySpendingLimit',
+      },
+    };
+    mockFetch(403, errorBody);
+    const { api } = await import('../api');
+    const err = await api.submitPayment('agent-1', {
+      type: 'payment',
+      asset: 'XLM',
+      destination: 'GD...',
+      amount: '500',
+      reason: 'test payment',
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).status).toBe(403);
+    expect((err as ApiError).message).toBe('Daily limit exceeded');
+    expect((err as ApiError).responseBody).toEqual(errorBody);
+  });
 });
 
 describe('api.listAgents pagination (#380)', () => {
